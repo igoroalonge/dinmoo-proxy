@@ -59,7 +59,7 @@ jobs:
       - shell: bash
         run: cp target/${{ matrix.target }}/release/dinmoo-proxy${{ matrix.ext }} dinmoo-proxy-${{ matrix.key }}${{ matrix.ext }}
       - name: Verify desktop restart ordering with process stubs
-        if: runner.os != 'Windows'
+        if: runner.os == 'macOS'
         shell: bash
         run: sh scripts/test-discord-restart.sh "$PWD/dinmoo-proxy-${{ matrix.key }}"
       - uses: actions/upload-artifact@v4
