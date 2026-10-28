@@ -33,6 +33,7 @@ for attempt in 1 2 3 4 5 6 7 8 9 10; do
 done
 grep -q -- '--proxy-server=socks5://127.0.0.1:1080' "$test_dir/launch"
 grep -q -- '--force-webrtc-ip-handling-policy=disable_non_proxied_udp' "$test_dir/launch"
+grep -qx -- '-n' "$test_dir/launch"
 rm "$test_dir/launch"
 if DINMOO_RESTART_TEST_ERROR=yes "$binary" discord; then
     echo 'FAIL: a process-inspection error was ignored' >&2

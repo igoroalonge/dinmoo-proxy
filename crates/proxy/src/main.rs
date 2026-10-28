@@ -815,6 +815,7 @@ fn restart_discord(proxy: &str) -> Result<()> {
         stop_discord()?;
         let status = std::process::Command::new("open")
             .args([
+                "-n",
                 "-a",
                 "Discord",
                 "--args",
