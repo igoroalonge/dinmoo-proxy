@@ -774,16 +774,45 @@ fn stop_discord() -> Result<()> {
     bail!("Discord did not exit within five seconds; retry the command after closing Discord")
 }
 
+#[cfg(target_os = "macos")]
+fn macos_discord_executable() -> Result<std::path::PathBuf> {
+    let home = std::path::PathBuf::from(env::var("HOME")?);
+    for bundle in [
+        home.join("Applications/Discord.app"),
+        std::path::PathBuf::from("/Applications/Discord.app"),
+    ] {
+        let executable = bundle.join("Contents/MacOS/Discord");
+        if executable.is_file() {
+            return Ok(executable);
+        }
+    }
+
+    let result = std::process::Command::new("mdfind")
+        .arg("kMDItemCFBundleIdentifier == \"com.hnc.Discord\"")
+        .output()
+        .context("could not locate Discord with Spotlight")?;
+    if !result.status.success() {
+        bail!("could not locate Discord; install Discord.app first");
+    }
+    for bundle in String::from_utf8_lossy(&result.stdout).lines() {
+        let executable = std::path::Path::new(bundle.trim()).join("Contents/MacOS/Discord");
+        if executable.is_file() {
+            return Ok(executable);
+        }
+    }
+    bail!("could not locate Discord.app; install it in /Applications or ~/Applications")
+}
+
 fn restart_discord_direct() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         stop_discord()?;
-        let s = std::process::Command::new("open")
-            .args(["-a", "Discord"])
-            .status()?;
-        if !s.success() {
-            bail!("could not relaunch Discord")
-        }
+        std::process::Command::new(macos_discord_executable()?)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|_| "could not relaunch Discord")?;
     }
     #[cfg(target_os = "linux")]
     {
@@ -813,20 +842,16 @@ fn restart_discord(proxy: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         stop_discord()?;
-        let status = std::process::Command::new("open")
+        std::process::Command::new(macos_discord_executable()?)
             .args([
-                "-n",
-                "-a",
-                "Discord",
-                "--args",
                 &format!("--proxy-server={proxy}"),
-                "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE api-proxy.dinmoo.com",
                 "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
             ])
-            .status()?;
-        if !status.success() {
-            bail!("could not launch Discord; install Discord.app first");
-        }
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|_| "could not launch Discord; install Discord.app first")?;
     }
     #[cfg(target_os = "linux")]
     {
@@ -834,7 +859,6 @@ fn restart_discord(proxy: &str) -> Result<()> {
         let status = std::process::Command::new("discord")
             .args([
                 format!("--proxy-server={proxy}"),
-                "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE api-proxy.dinmoo.com".to_owned(),
                 "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned(),
             ])
             .spawn();
@@ -849,7 +873,7 @@ fn restart_discord(proxy: &str) -> Result<()> {
             .status();
         let local = std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA is not set")?;
         let exe = std::path::PathBuf::from(local).join(r"Discord\Update.exe");
-        let status = std::process::Command::new(exe).args(["--processStart", "Discord.exe", "--process-start-args", &format!("--proxy-server={proxy} --host-resolver-rules=\"MAP * ~NOTFOUND, EXCLUDE api-proxy.dinmoo.com\" --force-webrtc-ip-handling-policy=disable_non_proxied_udp")]).spawn();
+        let status = std::process::Command::new(exe).args(["--processStart", "Discord.exe", "--process-start-args", &format!("--proxy-server={proxy} --force-webrtc-ip-handling-policy=disable_non_proxied_udp")]).spawn();
         if status.is_err() {
             bail!("could not launch Discord; install the desktop client first");
         }
