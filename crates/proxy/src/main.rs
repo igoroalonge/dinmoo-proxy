@@ -476,9 +476,13 @@ fn install_user_service(binary: &std::path::Path, token: &str) -> Result<()> {
         std::fs::write(&envfile, format!("DINMOO_PROXY_TOKEN={token}\n"))?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&envfile, std::fs::Permissions::from_mode(0o600))?;
-        let envpath = systemd_quote(&envfile.display().to_string());
+        let envpath = envfile.display().to_string();
+        if envpath.contains(['\n', '\r']) {
+            bail!("client configuration path cannot contain newlines");
+        }
+        let envpath = envpath.replace('%', "%%");
         let executable = systemd_quote(&binary.display().to_string());
-        let unit = format!("[Unit]\nDescription=Dinmoo Discord proxy client\nAfter=network-online.target\n[Service]\nEnvironmentFile=\"{envpath}\"\nExecStart=\"{executable}\" client\nRestart=on-failure\n[Install]\nWantedBy=default.target\n");
+        let unit = format!("[Unit]\nDescription=Dinmoo Discord proxy client\nAfter=network-online.target\n[Service]\nEnvironmentFile={envpath}\nExecStart=\"{executable}\" client\nRestart=on-failure\nRestartSec=3\n[Install]\nWantedBy=default.target\n");
         std::fs::write(units.join("dinmoo-proxy.service"), unit)?;
         let status = std::process::Command::new("systemctl")
             .args(["--user", "daemon-reload"])
