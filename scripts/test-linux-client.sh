@@ -1,6 +1,5 @@
 #!/bin/sh
 set -eu
-: "${DINMOO_PROXY_TOKEN:?Set your gateway token before this integration test}"
 binary=${1:?Pass the absolute path to the Linux CLI binary}
 [ ! -e "$HOME/.config/systemd/user/dinmoo-proxy.service" ]
 [ ! -e "$HOME/.config/dinmoo-proxy" ]

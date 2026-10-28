@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if first == "--help" || first == "-h" || first == "help" {
-        println!("dinmoo-proxy\nUsage:\n  dinmoo-proxy install\n  dinmoo-proxy install-local\n  dinmoo-proxy check\n  dinmoo-proxy on\n  dinmoo-proxy off\n  dinmoo-proxy status\n  dinmoo-proxy uninstall\n  dinmoo-proxy client [listen-address] [gateway-address]\n  dinmoo-proxy gateway [listen-address]\n  dinmoo-proxy discord [socks5-url]\n\nEnvironment: DINMOO_PROXY_TOKEN (minimum 32 bytes); DINMOO_MAX_SESSIONS (default 1024, maximum 4096); gateway also requires DINMOO_TLS_CERT_DER and DINMOO_TLS_KEY_DER files.");
+        println!("dinmoo-proxy\nUsage:\n  dinmoo-proxy install\n  dinmoo-proxy install-local\n  dinmoo-proxy check\n  dinmoo-proxy on\n  dinmoo-proxy off\n  dinmoo-proxy status\n  dinmoo-proxy uninstall\n  dinmoo-proxy client [listen-address] [gateway-address]\n  dinmoo-proxy gateway [listen-address]\n  dinmoo-proxy discord [socks5-url]\n\nPublic access: no token required. Optional private gateway: DINMOO_PROXY_TOKEN (minimum 32 bytes); DINMOO_MAX_SESSIONS (default 1024, maximum 4096); gateway also requires DINMOO_TLS_CERT_DER and DINMOO_TLS_KEY_DER files.");
         return Ok(());
     }
     if first == "install" {
@@ -83,8 +83,7 @@ async fn main() -> Result<()> {
     }
     if first == "install-local" {
         let path = env::current_exe()?;
-        let token =
-            env::var("DINMOO_PROXY_TOKEN").context("set DINMOO_PROXY_TOKEN before local setup")?;
+        let token = env::var("DINMOO_PROXY_TOKEN").unwrap_or_default();
         validate_install_token(&token)?;
         install_user_service(&path, &token)?;
         wait_for_discord_route().await?;
@@ -117,9 +116,8 @@ async fn main() -> Result<()> {
     if mode == "client" && !listen.ip().is_loopback() {
         bail!("local SOCKS listener must bind to a loopback address");
     }
-    let token =
-        env::var("DINMOO_PROXY_TOKEN").context("set DINMOO_PROXY_TOKEN to a long random secret")?;
-    if token.len() < 32 || token.len() > 1024 {
+    let token = env::var("DINMOO_PROXY_TOKEN").unwrap_or_default();
+    if !token.is_empty() && (token.len() < 32 || token.len() > 1024) {
         bail!("DINMOO_PROXY_TOKEN must be 32 to 1024 bytes");
     }
     let mut root_store = RootCertStore::empty();
@@ -226,8 +224,7 @@ struct ReleaseManifest {
 }
 
 async fn install() -> Result<()> {
-    let token = env::var("DINMOO_PROXY_TOKEN")
-        .context("set DINMOO_PROXY_TOKEN from your account enrollment before installing")?;
+    let token = env::var("DINMOO_PROXY_TOKEN").unwrap_or_default();
     validate_install_token(&token)?;
     let os = if cfg!(target_os = "macos") {
         "macos"
@@ -398,6 +395,9 @@ async fn check_discord_route() -> Result<()> {
 }
 
 fn validate_install_token(token: &str) -> Result<()> {
+    if token.is_empty() {
+        return Ok(());
+    }
     if !(32..=1024).contains(&token.len())
         || !token
             .bytes()
@@ -747,12 +747,37 @@ fn uninstall() -> Result<()> {
     restart_discord_direct()
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn stop_discord() -> Result<()> {
+    let stopped = std::process::Command::new("pkill")
+        .args(["-x", "Discord"])
+        .output()?;
+    if !stopped.status.success() && stopped.status.code() != Some(1) {
+        bail!(
+            "could not stop Discord: {}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+    }
+    for _ in 0..50 {
+        let status = std::process::Command::new("pgrep")
+            .args(["-x", "Discord"])
+            .output()?
+            .status;
+        if status.code() == Some(1) {
+            return Ok(());
+        }
+        if !status.success() {
+            bail!("could not check whether Discord has exited");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!("Discord did not exit within five seconds; retry the command after closing Discord")
+}
+
 fn restart_discord_direct() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("pkill")
-            .args(["-x", "Discord"])
-            .status();
+        stop_discord()?;
         let s = std::process::Command::new("open")
             .args(["-a", "Discord"])
             .status()?;
@@ -762,9 +787,7 @@ fn restart_discord_direct() -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("pkill")
-            .args(["-x", "Discord"])
-            .status();
+        stop_discord()?;
         std::process::Command::new("discord")
             .spawn()
             .map_err(|_| "could not relaunch Discord")?;
@@ -789,9 +812,7 @@ fn restart_discord(proxy: &str) -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("pkill")
-            .args(["-x", "Discord"])
-            .status();
+        stop_discord()?;
         let status = std::process::Command::new("open")
             .args([
                 "-a",
@@ -808,9 +829,7 @@ fn restart_discord(proxy: &str) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("pkill")
-            .args(["-x", "Discord"])
-            .status();
+        stop_discord()?;
         let status = std::process::Command::new("discord")
             .args([
                 format!("--proxy-server={proxy}"),
@@ -910,7 +929,10 @@ async fn authenticate_gateway<S: AsyncRead + AsyncWrite + Unpin>(
         bail!("invalid protocol header");
     }
     let token = read_string(stream).await?;
-    if token.len() != cfg.token.len() || !bool::from(token.as_bytes().ct_eq(cfg.token.as_bytes())) {
+    if !cfg.token.is_empty()
+        && (token.len() != cfg.token.len()
+            || !bool::from(token.as_bytes().ct_eq(cfg.token.as_bytes())))
+    {
         stream.write_all(&[0]).await?;
         bail!("invalid token");
     }
@@ -1466,7 +1488,7 @@ async fn write_string<S: AsyncWrite + Unpin>(s: &mut S, value: &str) -> Result<(
 }
 async fn read_string<S: AsyncRead + Unpin>(s: &mut S) -> Result<String> {
     let n = s.read_u16().await? as usize;
-    if n == 0 || n > 1024 {
+    if n > 1024 {
         bail!("invalid protocol string length");
     }
     let mut b = vec![0; n];
@@ -1611,6 +1633,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_gateway_accepts_a_client_without_a_token() {
+        let mut config = test_config();
+        config.token.clear();
+        let (mut client, mut gateway) = tokio::io::duplex(256);
+        let gateway_task =
+            tokio::spawn(async move { authenticate_gateway(&mut gateway, &config).await });
+        client.write_all(b"DMPX\x01").await.unwrap();
+        write_string(&mut client, "").await.unwrap();
+        let mut response = [0];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [1]);
+        gateway_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn gateway_authenticates_the_configured_tunnel_token() {
         let config = test_config();
         let (mut client, mut gateway) = tokio::io::duplex(256);
@@ -1645,7 +1682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tls_gateway_accepts_authenticated_client_and_enforces_socks_policy() {
+    async fn tls_public_gateway_accepts_tokenless_client_and_enforces_socks_policy() {
         let certificate =
             CertificateDer::from(include_bytes!("../tests/fixtures/localhost-cert.der").to_vec());
         let root_certificate =
@@ -1667,6 +1704,7 @@ mod tests {
                 .with_no_client_auth(),
         );
         let mut config = test_config();
+        config.token.clear();
         config.server_tls = Some(server_tls);
         config.client_tls = client_tls.clone();
 

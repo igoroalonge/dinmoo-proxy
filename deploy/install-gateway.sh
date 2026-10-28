@@ -1,4 +1,5 @@
 #!/bin/sh
+# Use - as token-file for public access.
 # Run as root: sh install-gateway.sh <linux-binary> <token-file> <systemd-unit>
 set -eu
 [ "$(id -u)" = 0 ] || { echo 'Run as root' >&2; exit 1; }
@@ -15,8 +16,8 @@ install -m 755 "$binary" /usr/local/bin/dinmoo-proxy.new
 mv /usr/local/bin/dinmoo-proxy.new /usr/local/bin/dinmoo-proxy
 python3 - "$token_file" <<'PY'
 import os, pathlib, re, sys
-token = pathlib.Path(sys.argv[1]).read_text().strip()
-if not re.fullmatch(r'[A-Za-z0-9_-]{32,1024}', token):
+token = '' if sys.argv[1] == '-' else pathlib.Path(sys.argv[1]).read_text().strip()
+if token and not re.fullmatch(r'[A-Za-z0-9_-]{32,1024}', token):
     raise SystemExit('Invalid token')
 path = pathlib.Path('/etc/dinmoo-proxy/gateway.env')
 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

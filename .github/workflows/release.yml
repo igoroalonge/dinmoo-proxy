@@ -43,10 +43,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Check Unix installer syntax
+        if: runner.os != 'Windows'
+        run: sh -n scripts/install.sh scripts/local-smoke.sh scripts/test-linux-client.sh scripts/test-discord-restart.sh
+      - name: Check PowerShell installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/scripts/install.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { $errors | Format-List; exit 1 }
       - run: cargo test --locked --target ${{ matrix.target }}
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - shell: bash
         run: cp target/${{ matrix.target }}/release/dinmoo-proxy${{ matrix.ext }} dinmoo-proxy-${{ matrix.key }}${{ matrix.ext }}
+      - name: Verify desktop restart ordering with process stubs
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh scripts/test-discord-restart.sh "$PWD/dinmoo-proxy-${{ matrix.key }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.key }}

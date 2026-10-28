@@ -1,8 +1,5 @@
 #!/bin/sh
 set -eu
-: "${DINMOO_PROXY_TOKEN:?Set DINMOO_PROXY_TOKEN to your enrolled token first}"
-case "$DINMOO_PROXY_TOKEN" in *[!A-Za-z0-9_-]*) echo 'Token must use URL-safe characters' >&2; exit 1;; esac
-[ "${#DINMOO_PROXY_TOKEN}" -ge 32 ] && [ "${#DINMOO_PROXY_TOKEN}" -le 1024 ] || { echo 'Token must be 32 to 1024 characters' >&2; exit 1; }
 os=$(uname -s); arch=$(uname -m)
 case "$os" in Darwin) os=macos;; Linux) os=linux;; *) echo "Unsupported OS: $os" >&2; exit 1;; esac
 case "$arch" in x86_64|amd64) arch=x86_64;; aarch64|arm64) arch=aarch64;; *) echo "Unsupported architecture: $arch" >&2; exit 1;; esac

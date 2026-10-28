@@ -1,6 +1,4 @@
 $ErrorActionPreference = 'Stop'
-$token = $env:DINMOO_PROXY_TOKEN
-if ([string]::IsNullOrWhiteSpace($token) -or $token.Length -lt 32 -or $token.Length -gt 1024 -or $token -notmatch '^[A-Za-z0-9_-]+$') { throw 'Set DINMOO_PROXY_TOKEN to your enrolled URL-safe token (at least 32 characters).' }
 try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch { }
 Add-Type -AssemblyName System.Net.Http
 
