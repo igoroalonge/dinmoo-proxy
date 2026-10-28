@@ -1,0 +1,21 @@
+[Unit]
+Description=Dinmoo Discord proxy TLS gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dinmoo-proxy
+Group=dinmoo-proxy
+EnvironmentFile=/etc/dinmoo-proxy/gateway.env
+ExecStart=/usr/local/bin/dinmoo-proxy gateway 0.0.0.0:8443
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/dinmoo-proxy
+
+[Install]
+WantedBy=multi-user.target

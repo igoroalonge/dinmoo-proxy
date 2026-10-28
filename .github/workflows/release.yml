@@ -1,0 +1,91 @@
+name: Cross-platform release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            key: linux-x86_64
+            ext: ''
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            key: linux-aarch64
+            ext: ''
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            key: macos-x86_64
+            ext: ''
+          - os: macos-15
+            target: aarch64-apple-darwin
+            key: macos-aarch64
+            ext: ''
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            key: windows-x86_64
+            ext: .exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            key: windows-aarch64
+            ext: .exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --locked --target ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - shell: bash
+        run: cp target/${{ matrix.target }}/release/dinmoo-proxy${{ matrix.ext }} dinmoo-proxy-${{ matrix.key }}${{ matrix.ext }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.key }}
+          path: dinmoo-proxy-${{ matrix.key }}${{ matrix.ext }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksum manifest
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path('dist')
+          tag = os.environ['RELEASE_TAG']
+          repository = os.environ['RELEASE_REPOSITORY']
+          assets = {}
+          for path in sorted(root.glob('dinmoo-proxy-*')):
+              key = path.name.removeprefix('dinmoo-proxy-').removesuffix('.exe')
+              assets[key] = {
+                  'url': f'https://github.com/{repository}/releases/download/{tag}/{path.name}',
+                  'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+              }
+          (root / 'SHA256SUMS').write_text(''.join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in sorted(root.glob('dinmoo-proxy-*'))))
+          (root / 'latest.json').write_text(json.dumps({'assets': assets}, indent=2) + '\n')
+          PY
+      - name: Include terminal installers
+        run: |
+          cp scripts/install.sh scripts/install.ps1 dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
