@@ -8,7 +8,14 @@ use crate::{
     SOCKS_HANDSHAKE_TIMEOUT, TCP_COPY_BUFFER_SIZE, TLS_HANDSHAKE_TIMEOUT,
 };
 use rustls::pki_types::ServerName;
-use std::{error::Error, fmt, future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    future::Future,
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpStream, UdpSocket},
@@ -255,7 +262,8 @@ where
         return Ok(());
     }
     if command == 3 {
-        return proxy_udp_associate(local, &mut remote).await;
+        let ip = host.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        return proxy_udp_associate(local, &mut remote, SocketAddr::new(ip, port)).await;
     }
     local.write_all(&response).await?;
     if let Some(identity) = identity {
@@ -298,19 +306,32 @@ async fn read_attach<R: AsyncRead + Unpin>(remote: &mut R) -> Result<()> {
     }
 }
 
-async fn proxy_udp_associate<L, R>(local: &mut L, remote: &mut R) -> Result<()>
+/// Relays one UDP association. RFC 1928 section 6 lets the client declare the
+/// address it will send from, with zeros when it does not know it yet; zero parts
+/// match any loopback sender, and the first valid matching sender is pinned.
+async fn proxy_udp_associate<L, R>(
+    local: &mut L,
+    remote: &mut R,
+    declared: SocketAddr,
+) -> Result<()>
 where
     L: AsyncRead + AsyncWrite + Unpin,
     R: AsyncRead + AsyncWrite + Unpin,
 {
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
-    let local_addr = socket.local_addr()?;
-    let mut local_reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
-    local_reply.extend_from_slice(&local_addr.port().to_be_bytes());
-    local.write_all(&local_reply).await?;
+    let SocketAddr::V4(relay) = socket.local_addr()? else {
+        bail!("UDP relay must be IPv4");
+    };
+    local.write_all(&bound_reply(relay)).await?;
 
+    let declared = SocketAddr::new(declared.ip().to_canonical(), declared.port());
+    let admits = |source: SocketAddr| {
+        source.ip().is_loopback()
+            && (declared.ip().is_unspecified() || source.ip() == declared.ip())
+            && (declared.port() == 0 || source.port() == declared.port())
+    };
+    let mut peer = (declared.port() != 0 && admits(declared)).then_some(declared);
     let (mut reader, mut writer) = tokio::io::split(remote);
-    let mut peer = None;
     let mut datagram = vec![0; 1501];
     let mut frames = FrameReader::default();
     let mut control = [0u8; 1];
@@ -322,14 +343,12 @@ where
             }
             result = socket.recv_from(&mut datagram) => {
                 let (length, source) = result?;
-                if !source.ip().is_loopback() || !valid_socks_udp_packet(&datagram[..length]) { continue; }
-                if let Some(known_peer) = peer {
-                    if source != known_peer { continue; }
-                } else {
-                    peer = Some(source);
-                }
-                if valid_socks_udp_packet(&datagram[..length]) {
-                    write_frame(&mut writer, &datagram[..length]).await?;
+                let packet = &datagram[..length];
+                let accepted = admits(source)
+                    && valid_socks_udp_packet(packet)
+                    && *peer.get_or_insert(source) == source;
+                if accepted {
+                    write_frame(&mut writer, packet).await?;
                 }
             }
             result = frames.read(&mut reader) => {
@@ -340,6 +359,12 @@ where
             }
         }
     }
+}
+
+fn bound_reply(address: SocketAddrV4) -> [u8; 10] {
+    let [a, b, c, d] = address.ip().octets();
+    let [high, low] = address.port().to_be_bytes();
+    [5, 0, 0, 1, a, b, c, d, high, low]
 }
 
 pub(crate) async fn write_string<S: AsyncWrite + Unpin>(s: &mut S, value: &str) -> Result<()> {
@@ -361,6 +386,7 @@ pub(crate) async fn read_string<S: AsyncRead + Unpin>(s: &mut S) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::udp::encode_socks_udp_packet;
     use rustls::{
         pki_types::{CertificateDer, PrivateKeyDer},
         ClientConfig, RootCertStore, ServerConfig,
@@ -371,7 +397,11 @@ mod tests {
         pin::Pin,
         task::{Context, Poll},
     };
-    use tokio::{io::ReadBuf, net::TcpListener, task::JoinHandle};
+    use tokio::{
+        io::{DuplexStream, ReadBuf},
+        net::TcpListener,
+        task::JoinHandle,
+    };
     use tokio_rustls::TlsAcceptor;
 
     fn temporary_directory(label: &str) -> PathBuf {
@@ -673,6 +703,106 @@ mod tests {
         ));
         assert!(bridge.await.unwrap().is_ok());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Opens a UDP association declaring `declared` against a fake gateway.
+    async fn associate(
+        declared: SocketAddr,
+    ) -> (
+        DuplexStream,
+        DuplexStream,
+        SocketAddr,
+        JoinHandle<Result<()>>,
+    ) {
+        let (mut app, mut local) = tokio::io::duplex(4096);
+        let (mut remote, mut gateway) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move { proxy_socks(&mut local, &mut remote).await });
+        let mut request = encode_socks_udp_packet(declared, &[]);
+        request[..2].copy_from_slice(&[5, 3]);
+        gateway
+            .write_all(&[5, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let reply = socks(&mut app, &request).await;
+        let mut forwarded = vec![0; 3 + request.len()];
+        gateway.read_exact(&mut forwarded).await.unwrap();
+        assert_eq!(forwarded, [&[5, 1, 0], &request[..]].concat());
+        let (host, port) = socks_request_target(&reply).unwrap();
+        (
+            app,
+            gateway,
+            SocketAddr::new(host.parse().unwrap(), port),
+            task,
+        )
+    }
+
+    const UDP_WAIT: Duration = Duration::from_secs(5);
+
+    fn media(payload: &[u8]) -> Vec<u8> {
+        encode_socks_udp_packet("104.29.151.152:19317".parse().unwrap(), payload)
+    }
+
+    async fn received(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
+        let mut buffer = [0; 1500];
+        let (length, source) = tokio::time::timeout(UDP_WAIT, socket.recv_from(&mut buffer))
+            .await
+            .expect("no datagram from the relay")
+            .unwrap();
+        (buffer[..length].to_vec(), source)
+    }
+
+    async fn frame(frames: &mut FrameReader, gateway: &mut DuplexStream) -> Vec<u8> {
+        tokio::time::timeout(UDP_WAIT, frames.read(gateway))
+            .await
+            .expect("no frame from the relay")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn udp_association_accepts_only_the_declared_loopback_sender() {
+        let app_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (app, mut gateway, relay, task) = associate(app_udp.local_addr().unwrap()).await;
+        let mut frames = FrameReader::default();
+        assert!(relay.ip().is_loopback() && relay.port() != 0);
+
+        // The declared sender receives gateway frames before it sends anything.
+        write_frame(&mut gateway, &media(b"first reply"))
+            .await
+            .unwrap();
+        assert_eq!(received(&app_udp).await, (media(b"first reply"), relay));
+        stranger.send_to(&media(b"stranger"), relay).await.unwrap();
+        app_udp.send_to(&media(b"app"), relay).await.unwrap();
+        stranger.send_to(&media(b"stranger"), relay).await.unwrap();
+        app_udp.send_to(&media(b"app again"), relay).await.unwrap();
+        assert_eq!(frame(&mut frames, &mut gateway).await, media(b"app"));
+        assert_eq!(frame(&mut frames, &mut gateway).await, media(b"app again"));
+        drop(app);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_association_without_a_declared_sender_pins_the_first_valid_one() {
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (app, mut gateway, relay, task) = associate("0.0.0.0:0".parse().unwrap()).await;
+        let mut frames = FrameReader::default();
+        first.send_to(b"not socks", relay).await.unwrap();
+        second.send_to(&media(b"second"), relay).await.unwrap();
+        first.send_to(&media(b"first"), relay).await.unwrap();
+        second
+            .send_to(&media(b"second again"), relay)
+            .await
+            .unwrap();
+        assert_eq!(frame(&mut frames, &mut gateway).await, media(b"second"));
+        assert_eq!(
+            frame(&mut frames, &mut gateway).await,
+            media(b"second again")
+        );
+        write_frame(&mut gateway, &media(b"reply")).await.unwrap();
+        assert_eq!(received(&second).await, (media(b"reply"), relay));
+        drop(app);
+        task.await.unwrap().unwrap();
     }
 
     #[test]
