@@ -26,6 +26,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     time::Instant,
 };
+use tokio_rustls::server::TlsStream;
 
 /// Logs a policy denial through `DENIALS` and returns it as a `Denied` error.
 macro_rules! deny {
@@ -44,7 +45,7 @@ const REPLY_SOURCES: usize = 32;
 
 static ACCEPT_ERRORS: LogLimiter = LogLimiter::new();
 static DENIALS: LogLimiter = LogLimiter::new();
-static SESSION_ERRORS: LogLimiter = LogLimiter::new();
+static HANDSHAKE_ERRORS: LogLimiter = LogLimiter::new();
 
 pub(crate) async fn serve(
     config: Arc<Config>,
@@ -78,15 +79,10 @@ pub(crate) async fn serve(
         let cfg = config.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let result = async {
-                stream.set_nodelay(true)?;
-                handle_gateway_connection(buffered(stream), &cfg, peer.ip()).await
-            }
-            .await;
-            if let Err(error) = result {
-                if !benign(&*error) && !error.is::<Denied>() {
-                    SESSION_ERRORS.log(format_args!("session: {error:#}"));
-                }
+            // TCP_NODELAY fails only on a socket that is already shut down.
+            if stream.set_nodelay(true).is_ok() {
+                // Logs its own failures.
+                let _ = handle_gateway_connection(buffered(stream), &cfg, peer.ip()).await;
             }
         });
     }
@@ -190,7 +186,7 @@ impl LogLimiter {
     fn log(&self, message: fmt::Arguments) {
         match self.check() {
             Some(0) => eprintln!("{message}"),
-            Some(suppressed) => eprintln!("{message} (+{suppressed} similar suppressed)"),
+            Some(suppressed) => eprintln!("{message} (+{suppressed} suppressed)"),
             None => {}
         }
     }
@@ -229,6 +225,29 @@ async fn handle_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
     cfg: &Config,
     peer: IpAddr,
 ) -> Result<()> {
+    // Scanners fail before authentication constantly, so those failures share one rate
+    // limit; an authenticated session's failure is rare and always logged.
+    let (stream, version) = open_gateway_connection(stream, cfg)
+        .await
+        .inspect_err(|error| {
+            if !benign(&**error) {
+                HANDSHAKE_ERRORS.log(format_args!("session: {error:#}"));
+            }
+        })?;
+    serve_gateway_connection(stream, version, cfg, peer)
+        .await
+        .inspect_err(|error| {
+            if !benign(&**error) && !error.is::<Denied>() {
+                eprintln!("session: {error:#}");
+            }
+        })
+}
+
+/// TLS accept and DMPX authentication; returns the protocol version.
+async fn open_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    cfg: &Config,
+) -> Result<(TlsStream<S>, u8)> {
     let acceptor = cfg
         .server_tls
         .as_ref()
@@ -243,6 +262,15 @@ async fn handle_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
     )
     .await
     .context("gateway authentication timed out")??;
+    Ok((stream, version))
+}
+
+async fn serve_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: TlsStream<S>,
+    version: u8,
+    cfg: &Config,
+    peer: IpAddr,
+) -> Result<()> {
     match version {
         2 => session::serve_control(&mut stream, cfg.sessions.clone(), peer).await,
         3 => {
@@ -298,6 +326,18 @@ async fn handle_socks<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     cfg: &Config,
 ) -> Result<()> {
+    let connect = |host: String, port| async move { connect_destination(cfg, &host, port).await };
+    handle_socks_with(stream, cfg, connect).await
+}
+
+/// `connect` opens an approved CONNECT destination, so tests can supply the upstream.
+async fn handle_socks_with<S, T, F, C>(stream: &mut S, cfg: &Config, connect: F) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(String, u16) -> C,
+    C: Future<Output = Result<Option<T>>>,
+{
     let request = tokio::time::timeout(SOCKS_HANDSHAKE_TIMEOUT, async {
         let version = stream.read_u8().await?;
         if version != 5 {
@@ -325,7 +365,7 @@ async fn handle_socks<S: AsyncRead + AsyncWrite + Unpin>(
             reply(stream, 2).await?;
             deny!("SOCKS TCP destination denied: {host:?}:{port}");
         }
-        let Some(mut target) = connect_destination(cfg, &host, port).await? else {
+        let Some(mut target) = connect(host, port).await? else {
             reply(stream, 5).await?;
             bail!("Discord destination did not resolve to a reachable public address");
         };
@@ -363,21 +403,30 @@ type DnsEntry = (Instant, Arc<[IpAddr]>);
 impl DnsCache {
     /// Failed and empty lookups are never cached.
     pub(crate) async fn resolve(&self, host: &str, port: u16) -> io::Result<Arc<[IpAddr]>> {
-        if let Some(addresses) = self.get(host, Instant::now()) {
+        self.resolve_with(host, || tokio::net::lookup_host((host, port)))
+            .await
+    }
+    async fn resolve_with<F, L, A>(&self, host: &str, lookup: F) -> io::Result<Arc<[IpAddr]>>
+    where
+        F: FnOnce() -> L,
+        L: Future<Output = io::Result<A>>,
+        A: Iterator<Item = SocketAddr>,
+    {
+        // Spell the key the way the allowlist reads names, so case and trailing-dot
+        // variants of one name cannot fill the cache.
+        let key = host.trim_end_matches('.').to_ascii_lowercase();
+        if let Some(addresses) = self.get(&key, Instant::now()) {
             return Ok(addresses);
         }
-        let addresses: Arc<[IpAddr]> = tokio::time::timeout(
-            DESTINATION_CONNECT_TIMEOUT,
-            tokio::net::lookup_host((host, port)),
-        )
-        .await
-        // A stalled resolver is an operator problem, so keep it out of the benign kinds.
-        .map_err(|_| io::Error::other("destination DNS lookup timed out"))??
-        .map(|address| address.ip())
-        .filter(|ip| is_public_ip(*ip))
-        .collect();
+        let addresses: Arc<[IpAddr]> = tokio::time::timeout(DESTINATION_CONNECT_TIMEOUT, lookup())
+            .await
+            // A stalled resolver is an operator problem, so keep it out of the benign kinds.
+            .map_err(|_| io::Error::other("destination DNS lookup timed out"))??
+            .map(|address| address.ip())
+            .filter(|ip| is_public_ip(*ip))
+            .collect();
         if !addresses.is_empty() && allowed_destination(host) {
-            self.insert(host, addresses.clone(), Instant::now());
+            self.insert(&key, addresses.clone(), Instant::now());
         }
         Ok(addresses)
     }
@@ -708,6 +757,60 @@ mod tests {
         assert!(received.is_empty());
     }
 
+    /// Runs a SOCKS CONNECT to discord.com:443, reachable only if `upstream`, then sends
+    /// `first` and disconnects; returns the result, the SOCKS reply and the upstream's bytes.
+    async fn socks_connect(upstream: bool, first: Vec<u8>) -> (Result<()>, [u8; 10], Vec<u8>) {
+        let (mut client, mut gateway) = tokio::io::duplex(64 * 1024);
+        let (gateway_upstream, mut upstream_end) = tokio::io::duplex(64 * 1024);
+        let socks = tokio::spawn(async move {
+            let connect = |host: String, port| async move {
+                assert_eq!((host.as_str(), port), ("discord.com", 443));
+                Ok(upstream.then_some(gateway_upstream))
+            };
+            handle_socks_with(&mut gateway, &test_config(), connect).await
+        });
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 3, 11];
+        request.extend_from_slice(b"discord.com");
+        request.extend_from_slice(&443u16.to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let reply = read_socks_reply(&mut client)
+            .await
+            .unwrap()
+            .try_into()
+            .unwrap();
+        // A refused CONNECT closes the stream before this write.
+        let _ = client.write_all(&first).await;
+        drop(client);
+        let mut received = Vec::new();
+        upstream_end.read_to_end(&mut received).await.unwrap();
+        drop(upstream_end);
+        (socks.await.unwrap(), reply, received)
+    }
+
+    #[tokio::test]
+    async fn socks_connect_relays_only_tls_for_an_allowed_server_name() {
+        let hello = client_hello("discord.com", true);
+        let (result, reply, received) = socks_connect(true, hello.clone()).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(reply, [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(received, hello);
+
+        let fronted = client_hello("example.com", true);
+        let (result, reply, received) = socks_connect(true, fronted).await;
+        assert!(result.unwrap_err().is::<Denied>());
+        assert_eq!(reply, [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert!(received.is_empty());
+
+        let (result, reply, received) = socks_connect(false, hello).await;
+        assert!(result.is_err());
+        assert_eq!(reply, [5, 5, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert!(received.is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn accept_errors_back_off_without_stopping_the_gateway() {
         use io::ErrorKind::*;
@@ -751,6 +854,13 @@ mod tests {
         drop(tls);
         let missing_close_notify: Box<dyn Error + Send + Sync> = server.await.unwrap().into();
         assert!(benign(&*missing_close_notify), "{missing_close_notify}");
+
+        let (_client, mut control) = tokio::io::duplex(64);
+        let registry = session::Registry::new(Duration::from_secs(600));
+        let vanished = session::serve_control(&mut control, registry, [127, 0, 0, 1].into())
+            .await
+            .unwrap_err();
+        assert!(benign(&*vanished), "{vanished}");
 
         let elapsed = || tokio::time::timeout(Duration::ZERO, std::future::pending::<()>());
         for error in [
@@ -917,14 +1027,63 @@ mod tests {
         assert!(cache.get("new.discord.com", now).is_some());
     }
 
+    type Answers = std::vec::IntoIter<SocketAddr>;
+
+    fn answers(addresses: &[&str]) -> impl FnOnce() -> std::future::Ready<io::Result<Answers>> {
+        let addresses: Vec<SocketAddr> = addresses.iter().map(|a| a.parse().unwrap()).collect();
+        move || std::future::ready(Ok(addresses.into_iter()))
+    }
+
+    fn cached_lookup() -> std::future::Ready<io::Result<Answers>> {
+        panic!("a cached name was looked up again")
+    }
+
     #[tokio::test]
     async fn dns_cache_keeps_only_public_answers_for_allowlisted_names() {
         let cache = DnsCache::default();
-        // IP literals resolve without contacting DNS.
-        let public: IpAddr = "1.1.1.1".parse().unwrap();
-        assert_eq!(*cache.resolve("1.1.1.1", 443).await.unwrap(), [public]);
-        assert!(cache.resolve("127.0.0.1", 443).await.unwrap().is_empty());
+        let public: IpAddr = "162.159.135.232".parse().unwrap();
+        let failed = || std::future::ready(Err::<Answers, _>(io::Error::other("SERVFAIL")));
+        assert!(cache.resolve_with("discord.com", failed).await.is_err());
+        let private = answers(&["10.0.0.1:443", "127.0.0.1:443"]);
+        assert!(cache
+            .resolve_with("discord.com", private)
+            .await
+            .unwrap()
+            .is_empty());
+        let outside = answers(&["93.184.215.14:443"]);
+        assert_eq!(
+            cache
+                .resolve_with("example.com", outside)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(cache.0.lock().unwrap().is_empty());
+
+        let mixed = answers(&["10.0.0.1:443", "162.159.135.232:443"]);
+        assert_eq!(
+            *cache.resolve_with("discord.com", mixed).await.unwrap(),
+            [public]
+        );
+        assert_eq!(
+            *cache
+                .resolve_with("discord.com", cached_lookup)
+                .await
+                .unwrap(),
+            [public]
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_cache_spellings_of_one_name_share_an_entry() {
+        let cache = DnsCache::default();
+        let mixed = answers(&["162.159.135.232:443"]);
+        cache.resolve_with("Discord.COM.", mixed).await.unwrap();
+        for host in ["discord.com", "DISCORD.com..", "discord.COM"] {
+            cache.resolve_with(host, cached_lookup).await.unwrap();
+        }
+        assert_eq!(cache.0.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
