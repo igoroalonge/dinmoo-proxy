@@ -93,7 +93,7 @@ pub(crate) async fn reload_media_targets(
     Ok(())
 }
 
-async fn handle_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
+pub(crate) async fn handle_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     cfg: &Config,
     peer: IpAddr,

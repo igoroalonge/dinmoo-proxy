@@ -19,6 +19,7 @@ use tokio_rustls::TlsAcceptor;
 mod bench;
 mod desktop;
 mod gateway;
+mod peer;
 mod policy;
 mod protection;
 mod session;

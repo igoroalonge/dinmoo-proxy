@@ -1,5 +1,6 @@
 //! Reconnecting client session controller.
 use super::{Id, Reason, PING, PONG, TERMINATE, WRITE_TIMEOUT};
+use crate::tunnel::Gateway;
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -48,6 +49,7 @@ async fn connected<S>(
     control: &mut S,
     id: Id,
     cfg: Arc<crate::Config>,
+    gateway: Arc<Gateway>,
     maximum: usize,
 ) -> crate::Result<Reason>
 where
@@ -68,12 +70,12 @@ where
                 if let Ok(Err(error)) = result { eprintln!("client tunnel: {error}"); }
             }
             accepted = listener.accept() => {
-                let (stream, _) = match accepted { Ok(pair) => pair, Err(error) => break Err(error.into()) };
+                let (stream, peer) = match accepted { Ok(pair) => pair, Err(error) => break Err(error.into()) };
                 let Ok(permit) = capacity.clone().try_acquire_owned() else { drop(stream); continue; };
-                let cfg = cfg.clone();
+                let tunnel = crate::tunnel::handle(stream, peer, cfg.clone(), gateway.clone(), id);
                 tunnels.spawn(async move {
                     let _permit = permit;
-                    crate::tunnel::handle(stream, cfg, id).await
+                    tunnel.await
                 });
             }
         }
@@ -85,14 +87,13 @@ where
 }
 
 pub async fn run(cfg: Arc<crate::Config>, maximum: usize) -> crate::Result<()> {
+    let gateway = Arc::new(Gateway::new(&cfg)?);
     let mut backoff = Backoff::default();
     loop {
         let started = Instant::now();
         let result = async {
-            let mut control = crate::tunnel::connect_gateway(&cfg, 2).await?;
-            let mut id = [0; 16];
-            tokio::time::timeout(WRITE_TIMEOUT, control.read_exact(&mut id)).await??;
-            connected(&mut control, id, cfg.clone(), maximum).await
+            let (mut control, id) = gateway.control().await?;
+            connected(&mut control, id, cfg.clone(), gateway.clone(), maximum).await
         }
         .await;
         match result {
