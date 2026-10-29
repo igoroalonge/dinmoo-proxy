@@ -118,6 +118,14 @@ async fn receive(flow: &Option<Flow>, buf: &mut [u8]) -> std::io::Result<(usize,
     }
 }
 
+async fn relay_write<F, E, T>(future: F) -> crate::Result<T>
+where
+    F: std::future::Future<Output = std::result::Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    Ok(tokio::time::timeout(Duration::from_secs(15), future).await??)
+}
+
 async fn relay<S, T>(
     control: &mut tokio_util::codec::Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     mut ws: WebSocketStream<T>,
@@ -137,15 +145,15 @@ where
         tokio::select! {
             _ = tokio::time::sleep_until(deadline), if flow.is_some() => {
                 flow = None;
-                control.send(wire::record(wire::REVOKE, &[])).await?;
+                relay_write(control.send(wire::record(wire::REVOKE, &[]))).await?;
             }
             record = control.next() => {
                 let Some(record) = record else { break }; let record = record?;
                 let (tag, data) = wire::unpack(&record)?;
                 match tag {
-                    wire::TEXT if data.len() <= wire::MAX_WS => ws.send(Message::Text(std::str::from_utf8(data)?.to_owned().into())).await?,
-                    wire::BINARY if data.len() <= wire::MAX_WS => ws.send(Message::Binary(data.to_vec().into())).await?,
-                    wire::CLOSE => { let _ = ws.close(None).await; break; }
+                    wire::TEXT if data.len() <= wire::MAX_WS => relay_write(ws.send(Message::Text(std::str::from_utf8(data)?.to_owned().into()))).await?,
+                    wire::BINARY if data.len() <= wire::MAX_WS => relay_write(ws.send(Message::Binary(data.to_vec().into()))).await?,
+                    wire::CLOSE => { let _ = relay_write(ws.close(None)).await; break; }
                     wire::UDP_SEND => {
                         if let Some(f) = &flow {
                             if authorized_udp(f, data) { f.socket.send_to(&data[wire::FLOW_ID_LEN..], f.endpoint).await?; }
@@ -164,20 +172,20 @@ where
                                 eprintln!("voice bridge received Discord Ready for {endpoint}");
                             }
                             drop(flow.take());
-                            control.send(wire::record(wire::REVOKE, &[])).await?;
+                            relay_write(control.send(wire::record(wire::REVOKE, &[]))).await?;
                             let bind = if endpoint.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
                             let socket = UdpSocket::bind(bind).await?;
                             let mut id = [0; wire::FLOW_ID_LEN];
                             rustls::crypto::ring::default_provider().secure_random.fill(&mut id).map_err(|_| "flow randomness failed")?;
                             flow = Some(Flow { id, socket, endpoint, expires: Instant::now() + wire::GRANT_TTL });
                             let mut ready = id.to_vec(); ready.extend_from_slice(text.as_bytes());
-                            control.send(wire::record(wire::READY, &ready)).await?;
-                        } else { control.send(wire::record(wire::TEXT, text.as_bytes())).await?; }
+                            relay_write(control.send(wire::record(wire::READY, &ready))).await?;
+                        } else { relay_write(control.send(wire::record(wire::TEXT, text.as_bytes()))).await?; }
                     }
-                    Message::Binary(data) => control.send(wire::record(wire::BINARY, &data)).await?,
-                    Message::Ping(data) => ws.send(Message::Pong(data)).await?,
+                    Message::Binary(data) => relay_write(control.send(wire::record(wire::BINARY, &data))).await?,
+                    Message::Ping(data) => relay_write(ws.send(Message::Pong(data))).await?,
                     Message::Pong(_) => {},
-                    Message::Close(_) => { let _ = control.send(wire::record(wire::CLOSE, &[])).await; break; }
+                    Message::Close(_) => { let _ = relay_write(control.send(wire::record(wire::CLOSE, &[]))).await; break; }
                     Message::Frame(_) => {},
                 }
             }
@@ -186,7 +194,7 @@ where
                 if let Some(f) = &flow {
                     if source == f.endpoint && len <= wire::MAX_UDP && Instant::now() < f.expires {
                         let mut data = f.id.to_vec(); data.extend_from_slice(&udp[..len]);
-                        control.send(wire::record(wire::UDP_RECV, &data)).await?;
+                        relay_write(control.send(wire::record(wire::UDP_RECV, &data))).await?;
                     }
                 }
             }
@@ -204,6 +212,29 @@ fn authorized_udp(flow: &Flow, data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn stalled_client_write_closes_voice_session() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (_client, gateway) = tokio::io::duplex(1);
+        let (upstream, server) = tokio::io::duplex(4096);
+        let mut control = wire::framed(gateway);
+        let ws = WebSocketStream::from_raw_socket(upstream, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        server
+            .send(Message::Binary(vec![1; 128].into()))
+            .await
+            .unwrap();
+        let start = Instant::now();
+        let result =
+            tokio::time::timeout(Duration::from_secs(16), relay(&mut control, ws, false)).await;
+        assert!(
+            result.is_ok(),
+            "stalled relay did not enforce its write timeout"
+        );
+        assert!(result.unwrap().is_err());
+        assert_eq!(start.elapsed(), Duration::from_secs(15));
+    }
+
     #[test]
     fn ready_only_accepts_public_fixed_endpoint() {
         assert_eq!(

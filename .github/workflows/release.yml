@@ -59,6 +59,10 @@ jobs:
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - shell: bash
         run: cp target/${{ matrix.target }}/release/dinmoo-proxy${{ matrix.ext }} dinmoo-proxy-${{ matrix.key }}${{ matrix.ext }}
+      - name: Verify gateway admission and idle cleanup on loopback
+        if: runner.os != 'Windows'
+        shell: bash
+        run: python3 scripts/test-gateway-protection.py "$PWD/dinmoo-proxy-${{ matrix.key }}"
       - name: Verify desktop restart ordering with process stubs
         if: runner.os == 'macOS'
         shell: bash

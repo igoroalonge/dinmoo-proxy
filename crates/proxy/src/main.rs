@@ -28,6 +28,8 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+mod protection;
+mod session;
 mod voice;
 
 #[cfg(target_os = "macos")]
@@ -50,12 +52,30 @@ struct Config {
     server_tls: Option<TlsAcceptor>,
     media_targets: Arc<tokio::sync::RwLock<Vec<SocketAddr>>>,
     voice_identity: Option<Arc<voice::identity::VoiceIdentity>>,
+    sessions: session::Registry,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let first = args.next().unwrap_or_else(|| "client".into());
+    if first == "gateway-sessions" {
+        println!("{}", session::admin::request("LIST").await?);
+        return Ok(());
+    }
+    if first == "gateway-terminate" {
+        let id = args
+            .next()
+            .ok_or("usage: dinmoo-proxy gateway-terminate <session-id>")?;
+        if id.len() != 32 || hex::decode(&id).is_err() {
+            bail!("session ID must contain 32 hex characters");
+        }
+        println!(
+            "{}",
+            session::admin::request(&format!("TERMINATE {id}")).await?
+        );
+        return Ok(());
+    }
     if first == "voice-identity" {
         let identity = voice::identity::VoiceIdentity::load_or_create(
             &voice::identity::identity_directory()?,
@@ -96,7 +116,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if first == "--help" || first == "-h" || first == "help" {
-        println!("dinmoo-proxy\nUsage:\n  dinmoo-proxy install\n  dinmoo-proxy install-local\n  dinmoo-proxy check\n  dinmoo-proxy on\n  dinmoo-proxy off\n  dinmoo-proxy status\n  dinmoo-proxy uninstall\n  dinmoo-proxy client [listen-address] [gateway-address]\n  dinmoo-proxy gateway [listen-address]\n  dinmoo-proxy discord [socks5-url]\n  sudo dinmoo-proxy media <media-ip:port> [...] (experimental macOS)\n\nPublic access: no token required. Optional private gateway: DINMOO_PROXY_TOKEN (minimum 32 bytes); DINMOO_MAX_SESSIONS (default 1024, maximum 4096); gateway also requires DINMOO_TLS_CERT_DER and DINMOO_TLS_KEY_DER files.");
+        println!("dinmoo-proxy\nUsage:\n  dinmoo-proxy install\n  dinmoo-proxy install-local\n  dinmoo-proxy check\n  dinmoo-proxy on\n  dinmoo-proxy off\n  dinmoo-proxy status\n  dinmoo-proxy uninstall\n  dinmoo-proxy client [listen-address] [gateway-address]\n  dinmoo-proxy gateway [listen-address]\n  dinmoo-proxy gateway-sessions\n  dinmoo-proxy gateway-terminate <session-id>\n  dinmoo-proxy discord [socks5-url]\n  sudo dinmoo-proxy media <media-ip:port> [...] (experimental macOS)\n\nPublic access: no token required. Optional private gateway: DINMOO_PROXY_TOKEN (minimum 32 bytes); DINMOO_MAX_SESSIONS (default 1024, maximum 4096); gateway also requires DINMOO_TLS_CERT_DER and DINMOO_TLS_KEY_DER files.");
         return Ok(());
     }
     if first == "install" {
@@ -173,8 +193,19 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let settings = if mode == "gateway" {
+        Some(protection::Settings::from_env()?)
+    } else {
+        None
+    };
     let config = Arc::new(Config {
         listen,
+        sessions: session::Registry::new(
+            settings
+                .as_ref()
+                .map(|s| s.idle)
+                .unwrap_or(Duration::from_secs(600)),
+        ),
         upstream: if mode == "client" {
             Some(
                 args.next()
@@ -215,21 +246,30 @@ async fn main() -> Result<()> {
         }
     }
     let max_sessions = configured_max_sessions()?;
+    if mode == "client" {
+        return session::client::run(config, max_sessions).await;
+    }
+    let settings = settings.ok_or("gateway safeguards not configured")?;
+    let admission = protection::Admission::new(max_sessions, settings.per_ip, settings.per_minute);
+    let _admin = match env::var_os("DINMOO_ADMIN_SOCKET") {
+        Some(path) => Some(session::admin::start(config.sessions.clone(), path.into())?),
+        None => None,
+    };
+    eprintln!("gateway safeguards: {} sessions/source, {} connections/minute/source, {}s client idle timeout (IPv6 grouped by /64)", settings.per_ip, settings.per_minute, settings.idle.as_secs());
     let listener = TcpListener::bind(config.listen).await?;
     eprintln!(
         "{mode} listening on {} (max sessions: {max_sessions})",
         config.listen
     );
-    let sessions = Arc::new(tokio::sync::Semaphore::new(max_sessions));
     let mut rejected_sessions = 0u64;
-    let mut next_rejection_log = 1001u64;
     loop {
-        let (stream, _) = listener.accept().await?;
-        let Ok(permit) = sessions.clone().try_acquire_owned() else {
+        let (stream, peer) = listener.accept().await?;
+        let Some(permit) = admission.acquire(peer.ip()) else {
             rejected_sessions = rejected_sessions.saturating_add(1);
-            if rejected_sessions == 1 || rejected_sessions == next_rejection_log {
-                eprintln!("session capacity reached; rejected {rejected_sessions} connections");
-                next_rejection_log = next_rejection_log.saturating_add(1000);
+            if rejected_sessions == 1 || rejected_sessions.is_multiple_of(1000) {
+                eprintln!(
+                    "session admission limit reached; rejected {rejected_sessions} connections"
+                );
             }
             drop(stream);
             continue;
@@ -237,7 +277,12 @@ async fn main() -> Result<()> {
         let cfg = config.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle(stream, cfg).await {
+            let result = async {
+                stream.set_nodelay(true)?;
+                handle_gateway_connection(stream, &cfg, peer.ip()).await
+            }
+            .await;
+            if let Err(e) = result {
                 eprintln!("session: {e:#}");
             }
         });
@@ -1008,47 +1053,62 @@ fn restart_discord(proxy: &str) -> Result<()> {
     Ok(())
 }
 
-async fn handle(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
+async fn connect_gateway(
+    cfg: &Config,
+    version: u8,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let upstream = cfg
+        .upstream
+        .as_ref()
+        .ok_or("gateway endpoint not configured")?;
+    let remote = tokio::time::timeout(DESTINATION_CONNECT_TIMEOUT, TcpStream::connect(upstream))
+        .await
+        .context("gateway connection timed out")?
+        .context("connect gateway")?;
+    remote.set_nodelay(true)?;
+    let (host, _) = upstream
+        .rsplit_once(':')
+        .ok_or("gateway must be host:port")?;
+    let server_name = ServerName::try_from(host.to_owned())?;
+    let mut remote = tokio::time::timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        TlsConnector::from(cfg.client_tls.clone()).connect(server_name, remote),
+    )
+    .await
+    .context("TLS gateway handshake timed out")?
+    .context("TLS gateway handshake")?;
+    tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, async {
+        remote.write_all(&[b'D', b'M', b'P', b'X', version]).await?;
+        write_string(&mut remote, &cfg.token).await?;
+        if remote.read_u8().await? != 1 {
+            bail!("gateway rejected authentication");
+        }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .context("gateway authentication timed out")??;
+    Ok(remote)
+}
+
+async fn handle(mut stream: TcpStream, cfg: Arc<Config>, session_id: session::Id) -> Result<()> {
     stream.set_nodelay(true)?;
-    if let Some(upstream) = &cfg.upstream {
-        let remote =
-            tokio::time::timeout(DESTINATION_CONNECT_TIMEOUT, TcpStream::connect(upstream))
-                .await
-                .context("gateway connection timed out")?
-                .context("connect gateway")?;
-        remote.set_nodelay(true)?;
-        let (host, _) = upstream
-            .rsplit_once(':')
-            .ok_or("gateway must be host:port")?;
-        let server_name = ServerName::try_from(host.to_owned())?;
-        let mut remote = tokio::time::timeout(
-            TLS_HANDSHAKE_TIMEOUT,
-            TlsConnector::from(cfg.client_tls.clone()).connect(server_name, remote),
-        )
-        .await
-        .context("TLS gateway handshake timed out")?
-        .context("TLS gateway handshake")?;
-        tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, async {
-            remote.write_all(b"DMPX\x01").await?;
-            write_string(&mut remote, &cfg.token).await?;
-            let mut ok = [0u8; 1];
-            remote.read_exact(&mut ok).await?;
-            if ok[0] != 1 {
-                bail!("gateway rejected authentication");
-            }
-            Ok::<(), Box<dyn Error + Send + Sync>>(())
-        })
-        .await
-        .context("gateway authentication timed out")??;
-        return proxy_socks_with_identity(&mut stream, &mut remote, cfg.voice_identity.as_deref())
-            .await;
-    }
-    handle_gateway_connection(stream, &cfg).await
+    let mut remote = connect_gateway(&cfg, 3).await?;
+    tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, async {
+        remote.write_all(&session_id).await?;
+        if remote.read_u8().await? != 1 {
+            bail!("gateway rejected data session");
+        }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .context("data session handshake timed out")??;
+    proxy_socks_with_identity(&mut stream, &mut remote, cfg.voice_identity.as_deref()).await
 }
 
 async fn handle_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     cfg: &Config,
+    peer: IpAddr,
 ) -> Result<()> {
     let acceptor = cfg
         .server_tls
@@ -1058,22 +1118,49 @@ async fn handle_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .context("TLS client handshake timed out")?
         .context("TLS client handshake")?;
-    tokio::time::timeout(
+    let version = tokio::time::timeout(
         AUTH_HANDSHAKE_TIMEOUT,
         authenticate_gateway(&mut stream, cfg),
     )
     .await
     .context("gateway authentication timed out")??;
-    handle_socks(&mut stream, cfg).await
+    match version {
+        2 => session::serve_control(&mut stream, cfg.sessions.clone(), peer).await,
+        3 => {
+            let mut id = [0; 16];
+            tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, stream.read_exact(&mut id)).await??;
+            let session = match cfg.sessions.attach(id, peer) {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, stream.write_u8(0)).await;
+                    return Err(error);
+                }
+            };
+            tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, stream.write_u8(1)).await??;
+            let mut stream = session::tracked_data(stream, &session);
+            tokio::select! {
+                biased;
+                _ = session.cancel.cancelled() => Ok(()),
+                result = handle_socks(&mut stream, cfg) => result,
+            }
+        }
+        // Legacy clients have no control channel and retain per-tunnel expiry.
+        1 => {
+            let (mut stream, activity) = protection::ActivityStream::new(stream);
+            protection::guard_idle(handle_socks(&mut stream, cfg), activity, cfg.sessions.idle)
+                .await
+        }
+        _ => unreachable!(),
+    }
 }
 
 async fn authenticate_gateway<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     cfg: &Config,
-) -> Result<()> {
+) -> Result<u8> {
     let mut magic = [0u8; 5];
     stream.read_exact(&mut magic).await?;
-    if &magic != b"DMPX\x01" {
+    if &magic[..4] != b"DMPX" || !(1..=3).contains(&magic[4]) {
         bail!("invalid protocol header");
     }
     let token = read_string(stream).await?;
@@ -1085,7 +1172,7 @@ async fn authenticate_gateway<S: AsyncRead + AsyncWrite + Unpin>(
         bail!("invalid token");
     }
     stream.write_all(&[1]).await?;
-    Ok(())
+    Ok(magic[4])
 }
 
 #[cfg(test)]
@@ -1241,7 +1328,7 @@ where
 
     let (mut reader, mut writer) = tokio::io::split(remote);
     let mut peer = None;
-    let mut datagram = vec![0; 1500];
+    let mut datagram = vec![0; 1501];
     let mut frames = FrameReader::default();
     let mut control = [0u8; 1];
     loop {
@@ -1252,7 +1339,7 @@ where
             }
             result = socket.recv_from(&mut datagram) => {
                 let (length, source) = result?;
-                if !source.ip().is_loopback() || length > 1500 { continue; }
+                if !source.ip().is_loopback() || !valid_socks_udp_packet(&datagram[..length]) { continue; }
                 if let Some(known_peer) = peer {
                     if source != known_peer { continue; }
                 } else {
@@ -1273,7 +1360,15 @@ where
 }
 
 fn valid_socks_udp_packet(packet: &[u8]) -> bool {
-    packet.len() >= 10 && packet.len() <= 1500 && packet[..2] == [0, 0] && packet[2] == 0
+    if !(4..=1500).contains(&packet.len()) || packet[..3] != [0, 0, 0] {
+        return false;
+    }
+    match packet[3] {
+        1 => packet.len() >= 10,
+        4 => packet.len() >= 22,
+        3 => packet.len() >= 5 && packet[4] > 0 && packet.len() >= 7 + packet[4] as usize,
+        _ => false,
+    }
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &[u8]) -> Result<()> {
@@ -1436,8 +1531,8 @@ async fn relay_udp_gateway<S: AsyncRead + AsyncWrite + Unpin>(
     cfg: &Config,
 ) -> Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let mut buffer_v4 = vec![0; 1500];
-    let mut buffer_v6 = vec![0; 1500];
+    let mut buffer_v4 = vec![0; 1501];
+    let mut buffer_v6 = vec![0; 1501];
     let mut permitted_targets: VecDeque<(SocketAddr, tokio::time::Instant)> = VecDeque::new();
     let mut dns_cache: HashMap<(String, u16), (tokio::time::Instant, Vec<SocketAddr>)> =
         HashMap::new();
@@ -1497,8 +1592,7 @@ async fn relay_udp_gateway<S: AsyncRead + AsyncWrite + Unpin>(
         if !permitted_targets.iter().any(|(peer, _)| *peer == source) {
             continue;
         }
-        let response = encode_socks_udp_packet(source, &buffer[..length]);
-        write_frame(&mut writer, &response).await?;
+        forward_udp_response(&mut writer, source, &buffer[..length]).await?;
     }
 }
 
@@ -1592,6 +1686,19 @@ fn parse_socks_udp_packet(packet: &[u8]) -> Result<(String, u16, Vec<u8>)> {
     }
     let port = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
     Ok((host, port, packet[offset + 2..].to_vec()))
+}
+
+async fn forward_udp_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    source: SocketAddr,
+    payload: &[u8],
+) -> Result<bool> {
+    let response = encode_socks_udp_packet(source, payload);
+    if response.len() > 1500 {
+        return Ok(false);
+    }
+    write_frame(writer, &response).await?;
+    Ok(true)
 }
 
 fn encode_socks_udp_packet(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
@@ -1804,6 +1911,33 @@ mod tests {
 
         let truncated = [0, 0, 0, 3, 8, b'd', b'i', b's', b's', b'c', b'o', b'r'];
         assert!(parse_socks_udp_packet(&truncated).is_err());
+    }
+
+    #[test]
+    fn udp_parser_rejects_every_truncated_address_without_panicking() {
+        for (kind, length) in [(1, 10), (4, 22)] {
+            for size in 4..length {
+                let mut packet = vec![0; size];
+                packet[3] = kind;
+                assert!(parse_socks_udp_packet(&packet).is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_udp_reply_is_dropped_and_next_reply_survives() {
+        let (mut sender, mut receiver) = tokio::io::duplex(4096);
+        for source in ["1.1.1.1:5000", "[2606:4700:4700::1111]:5000"] {
+            let source = source.parse().unwrap();
+            assert!(!forward_udp_response(&mut sender, source, &[1; 1491])
+                .await
+                .unwrap());
+            assert!(forward_udp_response(&mut sender, source, &[42])
+                .await
+                .unwrap());
+            let frame = read_frame(&mut receiver).await.unwrap();
+            assert_eq!(parse_socks_udp_packet(&frame).unwrap().2, [42]);
+        }
     }
 
     #[test]
@@ -2099,7 +2233,12 @@ mod tests {
         let (client_tunnel, gateway_tunnel) = tokio::io::duplex(64 * 1024);
         let gateway_config = config.clone();
         let gateway_task = tokio::spawn(async move {
-            handle_gateway_connection(gateway_tunnel, &gateway_config).await
+            handle_gateway_connection(
+                gateway_tunnel,
+                &gateway_config,
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await
         });
 
         let server_name = ServerName::try_from("localhost".to_owned()).unwrap();
@@ -2148,6 +2287,7 @@ mod tests {
             server_tls: None,
             media_targets: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             voice_identity: None,
+            sessions: session::Registry::new(Duration::from_secs(600)),
         }
     }
 }
