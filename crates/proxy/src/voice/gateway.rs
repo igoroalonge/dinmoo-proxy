@@ -1,5 +1,6 @@
 //! The gateway alone authenticates Discord and selects the media destination.
 use super::wire;
+use crate::{ContextExt, DESTINATION_CONNECT_TIMEOUT};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -11,9 +12,11 @@ use tokio::{
     time::Instant,
 };
 use tokio_tungstenite::{
-    tungstenite::{protocol::WebSocketConfig, Message},
+    tungstenite::{Message, Utf8Bytes},
     WebSocketStream,
 };
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Flow {
     id: [u8; wire::FLOW_ID_LEN],
@@ -91,19 +94,23 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     }
     crate::socks::reply(stream, 0).await?;
     let mut control = wire::framed(stream);
-    let first = tokio::time::timeout(Duration::from_secs(10), control.next())
-        .await?
-        .ok_or("missing voice path")??;
+    let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, control.next())
+        .await
+        .context("voice path timed out")?
+        .ok_or("missing voice path")?
+        .context("read voice path")?;
     let (tag, data) = wire::unpack(&first)?;
     let path = std::str::from_utf8(data)?;
     if tag != wire::PATH || !valid_path(path) {
         return Err("invalid voice path".into());
     }
     let addresses: Vec<_> = tokio::time::timeout(
-        Duration::from_secs(10),
+        DESTINATION_CONNECT_TIMEOUT,
         tokio::net::lookup_host((host, port)),
     )
-    .await??
+    .await
+    .context("voice DNS lookup timed out")?
+    .context("voice DNS lookup")?
     .collect();
     if addresses.is_empty()
         || addresses
@@ -113,25 +120,29 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         return Err("voice DNS destination denied".into());
     }
     let remote = tokio::time::timeout(
-        Duration::from_secs(10),
+        DESTINATION_CONNECT_TIMEOUT,
         TcpStream::connect(addresses.as_slice()),
     )
-    .await??;
+    .await
+    .context("voice server connection timed out")?
+    .context("connect voice server")?;
     let name = rustls::pki_types::ServerName::try_from(host.to_owned())?;
     let tls = tokio::time::timeout(
         Duration::from_secs(10),
         tokio_rustls::TlsConnector::from(cfg.client_tls.clone()).connect(name, remote),
     )
-    .await??;
+    .await
+    .context("voice server TLS handshake timed out")?
+    .context("voice server TLS handshake")?;
     let url = format!("wss://{host}:{port}{path}");
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(wire::MAX_WS))
-        .max_frame_size(Some(wire::MAX_WS));
+    let config = wire::websocket_config();
     let (ws, _) = tokio::time::timeout(
-        Duration::from_secs(10),
+        HANDSHAKE_TIMEOUT,
         tokio_tungstenite::client_async_with_config(url, tls, Some(config)),
     )
-    .await??;
+    .await
+    .context("voice WebSocket handshake timed out")?
+    .context("voice WebSocket handshake")?;
     if trace {
         eprintln!("voice bridge connected to Discord control WebSocket at {host}:{port}");
     }
@@ -150,7 +161,7 @@ where
     F: std::future::Future<Output = std::result::Result<T, E>>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    Ok(tokio::time::timeout(Duration::from_secs(15), future).await??)
+    Ok(tokio::time::timeout(wire::WRITE_TIMEOUT, future).await??)
 }
 
 async fn relay<S, T>(
@@ -176,27 +187,33 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut flow: Option<Flow> = None;
-    let mut udp = vec![0; wire::MAX_UDP + 1];
+    let mut udp = wire::UdpRecords::new(wire::UDP_RECV);
+    // One timer for the grant: WebSocket activity only moves `expires`, and the timer
+    // catches up when it fires, instead of a new timer registration per loop turn.
+    let expiry = tokio::time::sleep(wire::GRANT_TTL);
+    tokio::pin!(expiry);
     loop {
-        let deadline = flow
-            .as_ref()
-            .map(|f| f.expires)
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400));
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline), if flow.is_some() => {
-                flow = None;
-                relay_write(control.send(wire::record(wire::REVOKE, &[]))).await?;
+            () = &mut expiry, if flow.is_some() => {
+                match flow.as_ref().map(|f| f.expires) {
+                    Some(expires) if Instant::now() < expires => expiry.as_mut().reset(expires),
+                    _ => {
+                        flow = None;
+                        relay_write(control.send(wire::record(wire::REVOKE, &[]))).await?;
+                    }
+                }
             }
             record = control.next() => {
-                let Some(record) = record else { break }; let record = record?;
+                let Some(record) = record else { break }; let record = record?.freeze();
                 let (tag, data) = wire::unpack(&record)?;
                 match tag {
-                    wire::TEXT if data.len() <= wire::MAX_WS => relay_write(ws.send(Message::Text(std::str::from_utf8(data)?.to_owned().into()))).await?,
-                    wire::BINARY if data.len() <= wire::MAX_WS => relay_write(ws.send(Message::Binary(data.to_vec().into()))).await?,
+                    wire::TEXT if data.len() <= wire::MAX_WS => relay_write(ws.send(Message::Text(Utf8Bytes::try_from(record.slice(1..))?))).await?,
+                    wire::BINARY if data.len() <= wire::MAX_WS => relay_write(ws.send(Message::Binary(record.slice(1..)))).await?,
                     wire::CLOSE => { let _ = relay_write(ws.close(None)).await; break; }
                     wire::UDP_SEND => {
                         if let Some(f) = &flow {
-                            if authorized_udp(f, data) { f.socket.send_to(&data[wire::FLOW_ID_LEN..], f.endpoint).await?; }
+                            // UDP is lossy; a failed send drops one datagram, not the call.
+                            if authorized_udp(f, data) { let _ = f.socket.send_to(&data[wire::FLOW_ID_LEN..], f.endpoint).await; }
                         }
                     }
                     _ => return Err("invalid voice client record".into()),
@@ -217,25 +234,26 @@ where
                             let socket = UdpSocket::bind(bind).await?;
                             let mut id = [0; wire::FLOW_ID_LEN];
                             rustls::crypto::ring::default_provider().secure_random.fill(&mut id).map_err(|_| "flow randomness failed")?;
-                            flow = Some(Flow { id, socket, endpoint, expires: Instant::now() + wire::GRANT_TTL });
+                            let expires = Instant::now() + wire::GRANT_TTL;
+                            expiry.as_mut().reset(expires);
+                            flow = Some(Flow { id, socket, endpoint, expires });
                             let mut ready = id.to_vec(); ready.extend_from_slice(text.as_bytes());
                             relay_write(control.send(wire::record(wire::READY, &ready))).await?;
                         } else { relay_write(control.send(wire::record(wire::TEXT, text.as_bytes()))).await?; }
                     }
                     Message::Binary(data) => relay_write(control.send(wire::record(wire::BINARY, &data))).await?,
-                    Message::Ping(data) => relay_write(ws.send(Message::Pong(data))).await?,
+                    // tungstenite has already queued the Pong.
+                    Message::Ping(_) => relay_write(ws.flush()).await?,
                     Message::Pong(_) => {},
                     Message::Close(_) => { let _ = relay_write(control.send(wire::record(wire::CLOSE, &[]))).await; break; }
                     Message::Frame(_) => {},
                 }
             }
-            result = receive(&flow, &mut udp) => {
-                let (len, source) = result?;
+            result = receive(&flow, udp.datagram()) => {
                 if let Some(f) = &flow {
-                    if source == f.endpoint && len <= wire::MAX_UDP && Instant::now() < f.expires {
-                        let mut data = f.id.to_vec(); data.extend_from_slice(&udp[..len]);
-                        relay_write(control.send(wire::record(wire::UDP_RECV, &data))).await?;
-                    }
+                    udp.forward(control, &f.socket, &f.id, result, |source, _| {
+                        source == f.endpoint && Instant::now() < f.expires
+                    }).await?;
                 }
             }
         }
@@ -252,6 +270,149 @@ fn authorized_udp(flow: &Flow, data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voice::wire::tests::{flush_count, CountFlushes};
+    use std::sync::{atomic::AtomicUsize, Arc};
+    use tokio::{io::DuplexStream, task::JoinHandle};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    type Tunnel = Framed<DuplexStream, LengthDelimitedCodec>;
+
+    fn any_ip(_: IpAddr) -> bool {
+        true
+    }
+    const TEST_GRANTS: GrantScope = GrantScope {
+        allow: any_ip,
+        bind_v4: "127.0.0.1:0",
+        bind_v6: "[::1]:0",
+    };
+
+    async fn start_relay() -> (
+        Tunnel,
+        WebSocketStream<DuplexStream>,
+        Arc<AtomicUsize>,
+        JoinHandle<crate::Result<()>>,
+    ) {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (local, gateway) = tokio::io::duplex(65536);
+        let (upstream, server) = tokio::io::duplex(65536);
+        let (gateway, flushes) = CountFlushes::new(gateway);
+        let ws = WebSocketStream::from_raw_socket(upstream, Role::Client, None).await;
+        let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let task = tokio::spawn(async move {
+            relay_with(&mut wire::framed(gateway), ws, false, TEST_GRANTS).await
+        });
+        (wire::framed(local), server, flushes, task)
+    }
+
+    async fn next(client: &mut Tunnel) -> (u8, Vec<u8>) {
+        let record = client.next().await.unwrap().unwrap();
+        let (tag, payload) = wire::unpack(&record).unwrap();
+        (tag, payload.to_vec())
+    }
+
+    /// Sends Discord's Ready for `endpoint`; returns the flow ID the client receives.
+    async fn grant(
+        client: &mut Tunnel,
+        server: &mut WebSocketStream<DuplexStream>,
+        endpoint: SocketAddr,
+    ) -> Vec<u8> {
+        let ready = format!(
+            r#"{{"op":2,"d":{{"ip":"{}","port":{},"ssrc":1}}}}"#,
+            endpoint.ip(),
+            endpoint.port()
+        );
+        server.send(Message::Text(ready.into())).await.unwrap();
+        assert_eq!(next(client).await.0, wire::REVOKE);
+        let (tag, payload) = next(client).await;
+        assert_eq!(tag, wire::READY);
+        payload[..wire::FLOW_ID_LEN].to_vec()
+    }
+
+    async fn close(mut client: Tunnel, task: JoinHandle<crate::Result<()>>) {
+        client.send(wire::record(wire::CLOSE, &[])).await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn websocket_activity_extends_grant_until_idle_expiry() {
+        let (mut client, mut server, _, task) = start_relay().await;
+        let start = Instant::now();
+        grant(&mut client, &mut server, "127.0.0.1:9".parse().unwrap()).await;
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        server.send(Message::Text("{}".into())).await.unwrap();
+        assert_eq!(next(&mut client).await, (wire::TEXT, b"{}".to_vec()));
+        assert_eq!(next(&mut client).await.0, wire::REVOKE);
+        assert_eq!(start.elapsed(), Duration::from_secs(100) + wire::GRANT_TTL);
+        close(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn failed_discord_udp_send_keeps_session() {
+        let (mut client, mut server, _, task) = start_relay().await;
+        // A socket bound to loopback cannot send to TEST-NET-1: the kernel rejects it.
+        let mut send = grant(&mut client, &mut server, "192.0.2.1:9".parse().unwrap()).await;
+        send.extend_from_slice(b"lost");
+        client
+            .send(wire::record(wire::UDP_SEND, &send))
+            .await
+            .unwrap();
+        client
+            .send(wire::record(wire::BINARY, &[1, 2]))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.next().await.unwrap().unwrap().into_data().as_ref(),
+            &[1, 2]
+        );
+        close(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn discord_ping_is_answered() {
+        let (client, mut server, _, task) = start_relay().await;
+        server
+            .send(Message::Ping(b"p".as_slice().into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.next().await.unwrap().unwrap(),
+            Message::Pong(b"p".as_slice().into())
+        );
+        close(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn queued_discord_datagrams_share_one_flush_with_per_datagram_checks() {
+        let (mut client, mut server, flushes, task) = start_relay().await;
+        let media = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stranger = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let id = grant(&mut client, &mut server, media.local_addr().unwrap()).await;
+        let mut send = id.clone();
+        send.extend_from_slice(b"hello");
+        client
+            .send(wire::record(wire::UDP_SEND, &send))
+            .await
+            .unwrap();
+        let mut buf = [0; 16];
+        let (len, relay_udp) = media.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"hello");
+        media.writable().await.unwrap();
+        let before = flush_count(&flushes);
+        media.try_send_to(&[1; 50], relay_udp).unwrap();
+        stranger.send_to(&[2; 50], relay_udp).unwrap();
+        media
+            .try_send_to(&[3; wire::MAX_UDP + 1], relay_udp)
+            .unwrap();
+        media.try_send_to(&[4; 50], relay_udp).unwrap();
+        for byte in [1, 4] {
+            let mut expected = id.clone();
+            expected.extend_from_slice(&[byte; 50]);
+            assert_eq!(next(&mut client).await, (wire::UDP_RECV, expected));
+        }
+        assert_eq!(flush_count(&flushes) - before, 1);
+        close(client, task).await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stalled_client_write_closes_voice_session() {
         use tokio_tungstenite::tungstenite::protocol::Role;

@@ -1,4 +1,5 @@
-use super::wire;
+use super::wire::{self, WRITE_TIMEOUT};
+use crate::ContextExt;
 use futures_util::{SinkExt, StreamExt};
 use std::{
     net::SocketAddr,
@@ -12,11 +13,10 @@ use tokio::{
 };
 use tokio_tungstenite::{
     accept_hdr_async_with_config,
-    tungstenite::{self, protocol::WebSocketConfig, Message},
+    tungstenite::{self, Message, Utf8Bytes},
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn valid_target(path: &str, authority: &str, host: &str, port: u16) -> bool {
     if path.len() > 2048 || !(path == "/" || path.starts_with("/?")) {
@@ -28,7 +28,8 @@ fn valid_target(path: &str, authority: &str, host: &str, port: u16) -> bool {
     authority.host().eq_ignore_ascii_case(host) && authority.port_u16().unwrap_or(443) == port
 }
 
-fn rewrite_ready(raw: &[u8], port: u16) -> crate::Result<Vec<u8>> {
+/// Returns Discord's Ready pointing at the local UDP `port`, and the Ready SSRC.
+fn rewrite_ready(raw: &[u8], port: u16) -> crate::Result<(String, u32)> {
     let mut value: serde_json::Value = serde_json::from_slice(raw)?;
     if value.get("op").and_then(|v| v.as_u64()) != Some(2) {
         return Err("invalid voice Ready opcode".into());
@@ -44,29 +45,54 @@ fn rewrite_ready(raw: &[u8], port: u16) -> crate::Result<Vec<u8>> {
     {
         return Err("invalid voice Ready endpoint".into());
     }
+    let ssrc = data
+        .get("ssrc")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or("invalid voice Ready SSRC")?;
     data.insert("ip".into(), "127.0.0.1".into());
     data.insert("port".into(), port.into());
-    Ok(serde_json::to_vec(&value)?)
+    Ok((serde_json::to_string(&value)?, ssrc))
 }
 
 struct Flow {
     id: [u8; wire::FLOW_ID_LEN],
     socket: UdpSocket,
-    peer: Option<SocketAddr>,
+    peer: Peer,
 }
-impl Flow {
-    fn pin_peer(&mut self, peer: SocketAddr) -> bool {
-        if !peer.ip().is_loopback() {
-            return false;
-        }
-        match self.peer {
-            Some(pinned) => pinned == peer,
-            None => {
-                self.peer = Some(peer);
+
+/// The local socket allowed to use a flow: the loopback sender of the first IP discovery
+/// request that carries the Ready SSRC. Discord repeats discovery from new sockets, but
+/// the pin never moves: SSRCs are small and sequential, so re-pinning would reopen the
+/// takeover. This narrows the race for the local UDP port but is not authentication;
+/// any local user can see the port and guess the SSRC.
+struct Peer {
+    ssrc: u32,
+    pinned: Option<SocketAddr>,
+}
+impl Peer {
+    fn new(ssrc: u32) -> Self {
+        Self { ssrc, pinned: None }
+    }
+    fn accept(&mut self, from: SocketAddr, datagram: &[u8]) -> bool {
+        match self.pinned {
+            Some(pinned) => pinned == from,
+            None if from.ip().is_loopback() && self.discovery(datagram) => {
+                self.pinned = Some(from);
                 true
             }
+            None => false,
         }
     }
+    /// Discord IP discovery request: type 1, length 70, SSRC, then a 64-byte address.
+    fn discovery(&self, datagram: &[u8]) -> bool {
+        datagram.len() == 74
+            && datagram[..4] == [0x00, 0x01, 0x00, 0x46]
+            && datagram[4..8] == self.ssrc.to_be_bytes()
+    }
+}
+
+impl Flow {
     fn packet<'a>(&self, payload: &'a [u8]) -> Option<&'a [u8]> {
         if payload.len() < wire::FLOW_ID_LEN
             || payload.len() > wire::FLOW_ID_LEN + wire::MAX_UDP
@@ -90,15 +116,16 @@ where
     L: AsyncRead + AsyncWrite + Unpin,
     R: AsyncRead + AsyncWrite + Unpin,
 {
-    let tls = timeout(HANDSHAKE_TIMEOUT, identity.acceptor.accept(local)).await??;
+    let tls = timeout(HANDSHAKE_TIMEOUT, identity.acceptor.accept(local))
+        .await
+        .context("local voice TLS handshake timed out")?
+        .context("local voice TLS handshake")?;
     if tls.get_ref().1.server_name() != Some(host) {
         return Err("voice TLS server name mismatch".into());
     }
     let selected_path = Arc::new(Mutex::new(None));
     let capture = selected_path.clone();
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(wire::MAX_WS))
-        .max_frame_size(Some(wire::MAX_WS));
+    let config = wire::websocket_config();
     let mut ws = timeout(
         HANDSHAKE_TIMEOUT,
         accept_hdr_async_with_config(
@@ -130,7 +157,9 @@ where
             Some(config),
         ),
     )
-    .await??;
+    .await
+    .context("local voice WebSocket handshake timed out")?
+    .context("local voice WebSocket handshake")?;
     let path = selected_path
         .lock()
         .unwrap()
@@ -141,9 +170,11 @@ where
         WRITE_TIMEOUT,
         tunnel.send(wire::record(wire::PATH, path.as_bytes())),
     )
-    .await??;
+    .await
+    .context("voice path write timed out")?
+    .context("write voice path")?;
     let mut flow: Option<Flow> = None;
-    let mut datagram = vec![0u8; wire::MAX_UDP + 1];
+    let mut udp = wire::UdpRecords::new(wire::UDP_SEND);
     let result: crate::Result<()> = async {
         loop {
             tokio::select! {
@@ -160,24 +191,25 @@ where
                 }
                 incoming = tunnel.next() => {
                     let Some(incoming) = incoming else { return Ok(()); };
-                    let incoming = incoming?;
+                    let incoming = incoming?.freeze();
                     let (tag, payload) = wire::unpack(&incoming)?;
                     if matches!(tag, wire::TEXT | wire::BINARY) && payload.len() > wire::MAX_WS { return Err("oversized voice websocket message".into()); }
                     match tag {
-                        wire::TEXT => { let text = std::str::from_utf8(payload)?; timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.to_owned().into()))).await??; }
-                        wire::BINARY => { timeout(WRITE_TIMEOUT, ws.send(Message::Binary(payload.to_vec().into()))).await??; }
+                        wire::TEXT => { let text = Utf8Bytes::try_from(incoming.slice(1..))?; timeout(WRITE_TIMEOUT, ws.send(Message::Text(text))).await??; }
+                        wire::BINARY => { timeout(WRITE_TIMEOUT, ws.send(Message::Binary(incoming.slice(1..)))).await??; }
                         wire::READY => {
                             if payload.len() <= wire::FLOW_ID_LEN { return Err("invalid voice Ready record".into()); }
                             let id = payload[..wire::FLOW_ID_LEN].try_into().unwrap();
                             let socket = UdpSocket::bind("127.0.0.1:0").await?;
-                            let ready = rewrite_ready(&payload[wire::FLOW_ID_LEN..], socket.local_addr()?.port())?;
-                            flow = Some(Flow { id, socket, peer: None });
-                            timeout(WRITE_TIMEOUT, ws.send(Message::Text(String::from_utf8(ready)?.into()))).await??;
+                            let (ready, ssrc) = rewrite_ready(&payload[wire::FLOW_ID_LEN..], socket.local_addr()?.port())?;
+                            flow = Some(Flow { id, socket, peer: Peer::new(ssrc) });
+                            timeout(WRITE_TIMEOUT, ws.send(Message::Text(ready.into()))).await??;
                         }
                         wire::UDP_RECV => {
                             let current = flow.as_ref().ok_or("voice UDP before Ready")?;
-                            if let (Some(raw), Some(peer)) = (current.packet(payload), current.peer) {
-                                timeout(WRITE_TIMEOUT, current.socket.send_to(raw, peer)).await??;
+                            if let (Some(raw), Some(peer)) = (current.packet(payload), current.peer.pinned) {
+                                // UDP is lossy; a failed send drops one datagram, not the call.
+                                let _ = timeout(WRITE_TIMEOUT, current.socket.send_to(raw, peer)).await;
                             }
                         }
                         wire::REVOKE if payload.is_empty() => { flow = None; }
@@ -187,18 +219,13 @@ where
                 }
                 received = async {
                     match flow.as_ref() {
-                        Some(current) => current.socket.recv_from(&mut datagram).await,
+                        Some(current) => current.socket.recv_from(udp.datagram()).await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    let (len, peer) = received?;
                     let current = flow.as_mut().ok_or("voice UDP before Ready")?;
-                    if len <= wire::MAX_UDP && current.pin_peer(peer) {
-                        let mut payload = Vec::with_capacity(wire::FLOW_ID_LEN + len);
-                        payload.extend_from_slice(&current.id);
-                        payload.extend_from_slice(&datagram[..len]);
-                        timeout(WRITE_TIMEOUT, tunnel.send(wire::record(wire::UDP_SEND, &payload))).await??;
-                    }
+                    let peer = &mut current.peer;
+                    udp.forward(&mut tunnel, &current.socket, &current.id, received, |from, datagram| peer.accept(from, datagram)).await?;
                 }
             }
         }
@@ -210,38 +237,58 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voice::wire::tests::{flush_count, CountFlushes};
+    use std::sync::atomic::AtomicUsize;
+    use tokio::{io::DuplexStream, task::JoinHandle};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
     #[test]
     fn ready_preserves_every_field_except_endpoint() {
         let raw = br#"{"op":2,"d":{"ip":"203.0.113.5","port":5000,"ssrc":42,"modes":["a"],"extra":{"x":true}},"extra":7}"#;
-        let value: serde_json::Value =
-            serde_json::from_slice(&rewrite_ready(raw, 4567).unwrap()).unwrap();
+        let (ready, ssrc) = rewrite_ready(raw, 4567).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&ready).unwrap();
         let mut expected: serde_json::Value = serde_json::from_slice(raw).unwrap();
         expected["d"]["ip"] = "127.0.0.1".into();
         expected["d"]["port"] = 4567.into();
         assert_eq!(value, expected);
+        assert_eq!(ssrc, 42);
     }
     #[test]
     fn rejects_non_ready_and_invalid_ready() {
         for raw in [
             br#"{"op":3,"d":{"ip":"x","port":3}}"#.as_slice(),
             br#"{"op":2,"d":null}"#,
+            br#"{"op":2,"d":{"ip":"x","port":3}}"#,
+            br#"{"op":2,"d":{"ip":"x","port":3,"ssrc":-1}}"#,
+            br#"{"op":2,"d":{"ip":"x","port":3,"ssrc":4294967296}}"#,
+            br#"{"op":2,"d":{"ip":"x","port":3,"ssrc":"42"}}"#,
         ] {
             assert!(rewrite_ready(raw, 123).is_err());
         }
     }
     #[tokio::test]
-    async fn udp_flow_pins_source_and_rejects_stale_flow() {
+    async fn udp_flow_pins_only_a_loopback_discovery_for_its_ssrc() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut flow = Flow {
             id: [7; 16],
             socket,
-            peer: None,
+            peer: Peer::new(42),
         };
-        let peer: SocketAddr = "127.0.0.1:4000".parse().unwrap();
-        assert!(!flow.pin_peer("192.0.2.1:4000".parse().unwrap()));
-        assert!(flow.pin_peer(peer));
-        assert!(flow.pin_peer(peer));
-        assert!(!flow.pin_peer("127.0.0.1:4001".parse().unwrap()));
+        let app: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let mut addressed = discovery(42);
+        addressed[8..17].copy_from_slice(b"127.0.0.1");
+        assert!(!flow.peer.accept(app, b"rtp"));
+        assert!(!flow.peer.accept(app, &discovery(43)));
+        assert!(!flow.peer.accept(app, &discovery(42)[..73]));
+        assert!(!flow.peer.accept(app, &[discovery(42), vec![0]].concat()));
+        assert!(!flow
+            .peer
+            .accept("192.0.2.1:4000".parse().unwrap(), &discovery(42)));
+        assert!(flow.peer.accept(app, &addressed));
+        assert!(flow.peer.accept(app, b"rtp"));
+        assert!(!flow
+            .peer
+            .accept("127.0.0.1:4001".parse().unwrap(), &discovery(42)));
+        assert_eq!(flow.peer.pinned, Some(app));
         let mut packet = vec![7; 16];
         packet.extend_from_slice(b"raw udp");
         assert_eq!(flow.packet(&packet), Some(b"raw udp".as_slice()));
@@ -249,8 +296,35 @@ mod tests {
         assert!(flow.packet(&packet).is_none());
         assert!(flow.packet(&[7; 15]).is_none());
     }
-    #[tokio::test]
-    async fn tls_websocket_ready_and_udp_round_trip() {
+    type App = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<DuplexStream>>;
+    type Tunnel = Framed<DuplexStream, LengthDelimitedCodec>;
+
+    fn discovery(ssrc: u32) -> Vec<u8> {
+        let mut packet = vec![0; 74];
+        packet[..4].copy_from_slice(&[0, 1, 0, 70]);
+        packet[4..8].copy_from_slice(&ssrc.to_be_bytes());
+        packet
+    }
+
+    async fn next(gateway: &mut Tunnel) -> (u8, Vec<u8>) {
+        let record = timeout(Duration::from_secs(2), gateway.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (tag, payload) = wire::unpack(&record).unwrap();
+        (tag, payload.to_vec())
+    }
+
+    /// Runs the bridge behind a Discord-like TLS WebSocket and delivers Ready for SSRC 42
+    /// with flow ID [5; 16]. Returns the bridge's UDP endpoint and its tunnel flush count.
+    async fn start_bridge() -> (
+        App,
+        Tunnel,
+        SocketAddr,
+        Arc<AtomicUsize>,
+        JoinHandle<crate::Result<()>>,
+    ) {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = rcgen::CertificateParams::new(vec!["voice.discord.media".into()])
@@ -282,7 +356,8 @@ mod tests {
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
         let (client, mut local) = tokio::io::duplex(64 * 1024);
-        let (mut remote, gateway) = tokio::io::duplex(64 * 1024);
+        let (remote, gateway) = tokio::io::duplex(64 * 1024);
+        let (mut remote, flushes) = CountFlushes::new(remote);
         let task = tokio::spawn(async move {
             run(
                 &mut local,
@@ -301,11 +376,7 @@ mod tests {
             .await
             .unwrap();
         let mut gateway = wire::framed(gateway);
-        let path = gateway.next().await.unwrap().unwrap();
-        assert_eq!(
-            wire::unpack(&path).unwrap(),
-            (wire::PATH, b"/?v=8".as_slice())
-        );
+        assert_eq!(next(&mut gateway).await, (wire::PATH, b"/?v=8".to_vec()));
         let mut ready = vec![5; 16];
         ready.extend_from_slice(
             br#"{"op":2,"d":{"ip":"203.0.113.1","port":5000,"ssrc":42,"modes":["a"]}}"#,
@@ -318,18 +389,21 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&message).unwrap();
         assert_eq!(value["d"]["ip"], "127.0.0.1");
         assert_eq!(value["d"]["ssrc"], 42);
-        let endpoint = format!("127.0.0.1:{}", value["d"]["port"].as_u64().unwrap());
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        udp.send_to(b"discovery", &endpoint).await.unwrap();
-        let outgoing = timeout(Duration::from_secs(2), gateway.next())
-            .await
-            .unwrap()
-            .unwrap()
+        let endpoint = format!("127.0.0.1:{}", value["d"]["port"].as_u64().unwrap())
+            .parse()
             .unwrap();
-        let (tag, payload) = wire::unpack(&outgoing).unwrap();
+        (ws, gateway, endpoint, flushes, task)
+    }
+
+    #[tokio::test]
+    async fn tls_websocket_ready_and_udp_round_trip() {
+        let (mut ws, mut gateway, endpoint, _, task) = start_bridge().await;
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(&discovery(42), endpoint).await.unwrap();
+        let (tag, payload) = next(&mut gateway).await;
         assert_eq!(tag, wire::UDP_SEND);
         assert_eq!(&payload[..16], &[5; 16]);
-        assert_eq!(&payload[16..], b"discovery");
+        assert_eq!(payload[16..], discovery(42));
         let mut reply = vec![5; 16];
         reply.extend_from_slice(b"reply");
         gateway
@@ -342,7 +416,60 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&raw[..len], b"reply");
+        // Messages larger than the WebSocket read buffer pass both ways.
+        let large = vec![7; 100 * 1024];
+        ws.send(Message::Binary(large.clone().into()))
+            .await
+            .unwrap();
+        assert_eq!(next(&mut gateway).await, (wire::BINARY, large.clone()));
+        gateway
+            .send(wire::record(wire::BINARY, &large))
+            .await
+            .unwrap();
+        assert_eq!(
+            ws.next().await.unwrap().unwrap().into_data().as_ref(),
+            &large[..]
+        );
         ws.close(None).await.unwrap();
+        assert!(timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn udp_pins_only_the_discovery_sender_and_batches_records() {
+        let (_ws, mut gateway, endpoint, flushes, task) = start_bridge().await;
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let attacker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        app.writable().await.unwrap();
+        let before = flush_count(&flushes);
+        attacker.send_to(b"first", endpoint).unwrap();
+        app.try_send_to(&discovery(41), endpoint).unwrap();
+        app.try_send_to(b"early", endpoint).unwrap();
+        app.try_send_to(&discovery(42), endpoint).unwrap();
+        attacker.send_to(&discovery(42), endpoint).unwrap();
+        app.try_send_to(b"media", endpoint).unwrap();
+        for expected in [discovery(42), b"media".to_vec()] {
+            let (tag, payload) = next(&mut gateway).await;
+            assert_eq!(tag, wire::UDP_SEND);
+            assert_eq!(payload[16..], expected[..]);
+        }
+        assert_eq!(flush_count(&flushes) - before, 1);
+        let mut reply = vec![5; 16];
+        reply.extend_from_slice(b"reply");
+        gateway
+            .send(wire::record(wire::UDP_RECV, &reply))
+            .await
+            .unwrap();
+        let mut raw = [0; 16];
+        let (len, from) = timeout(Duration::from_secs(2), app.recv_from(&mut raw))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((&raw[..len], from), (b"reply".as_slice(), endpoint));
+        gateway.send(wire::record(wire::CLOSE, &[])).await.unwrap();
         assert!(timeout(Duration::from_secs(2), task)
             .await
             .unwrap()
