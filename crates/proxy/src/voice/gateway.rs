@@ -1,6 +1,6 @@
 //! The gateway alone authenticates Discord and selects the media destination.
 use super::wire;
-use crate::{ContextExt, DESTINATION_CONNECT_TIMEOUT};
+use crate::{ContextExt, DESTINATION_CONNECT_TIMEOUT, TLS_HANDSHAKE_TIMEOUT};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -128,7 +128,7 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     .context("connect voice server")?;
     let name = rustls::pki_types::ServerName::try_from(host.to_owned())?;
     let tls = tokio::time::timeout(
-        Duration::from_secs(10),
+        TLS_HANDSHAKE_TIMEOUT,
         tokio_rustls::TlsConnector::from(cfg.upstream_tls.clone()).connect(name, remote),
     )
     .await
