@@ -27,6 +27,28 @@ const _: () = assert!(CONTROL_TIMEOUT.as_millis() > 2 * CLIENT_PING_INTERVAL.as_
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CLIENTS: usize = 4096;
 
+/// What a gateway connection carries: the byte after the `DMPX` magic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TunnelKind {
+    /// One SOCKS stream with its own idle expiry, from clients without a control channel.
+    Legacy = 1,
+    Control = 2,
+    /// One SOCKS stream attached to a control session by its ID.
+    Data = 3,
+}
+impl TryFrom<u8> for TunnelKind {
+    type Error = &'static str;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Legacy),
+            2 => Ok(Self::Control),
+            3 => Ok(Self::Data),
+            _ => Err("unknown tunnel kind"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Reason {
@@ -237,6 +259,21 @@ mod tests {
         assert!(registry
             .attach(first.session.id, first.session.peer)
             .is_err());
+    }
+
+    #[test]
+    fn tunnel_kinds_are_the_dmpx_version_bytes() {
+        for (kind, byte) in [
+            (TunnelKind::Legacy, 1),
+            (TunnelKind::Control, 2),
+            (TunnelKind::Data, 3),
+        ] {
+            assert_eq!(kind as u8, byte);
+            assert_eq!(TunnelKind::try_from(byte), Ok(kind));
+        }
+        for byte in [0, 4, 255] {
+            assert!(TunnelKind::try_from(byte).is_err());
+        }
     }
 
     #[test]

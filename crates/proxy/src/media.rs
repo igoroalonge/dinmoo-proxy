@@ -18,9 +18,10 @@ pub async fn run(arguments: Vec<String>) -> Result<()> {
         Some(directory) => read_media_targets(directory)?,
         None => parse_media_targets(&arguments.join(","))?,
     };
-    let proxy: std::net::SocketAddr = std::env::var("DINMOO_MEDIA_SOCKS")
-        .unwrap_or_else(|_| "127.0.0.1:1080".into())
-        .parse()?;
+    let proxy = match std::env::var("DINMOO_MEDIA_SOCKS") {
+        Ok(proxy) => proxy.parse()?,
+        Err(_) => crate::DEFAULT_SOCKS_LISTEN,
+    };
     if !proxy.ip().is_loopback() || proxy.port() == 0 {
         return Err("DINMOO_MEDIA_SOCKS must be a loopback address with a nonzero port".into());
     }

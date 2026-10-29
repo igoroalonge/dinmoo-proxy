@@ -146,7 +146,7 @@ pub(crate) async fn install_local(binary: &std::path::Path, token: &str) -> Resu
         let _ = launch_discord_direct();
         return Err(error);
     }
-    restart_discord("socks5://127.0.0.1:1080").await
+    restart_discord(&crate::discord_proxy_url(crate::DEFAULT_SOCKS_LISTEN)).await
 }
 
 async fn read_limited_body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
@@ -185,7 +185,7 @@ pub(crate) async fn wait_for_discord_route() -> Result<()> {
 }
 
 pub(crate) async fn check_discord_route() -> Result<()> {
-    check_discord_route_at("127.0.0.1:1080".parse()?).await
+    check_discord_route_at(crate::DEFAULT_SOCKS_LISTEN).await
 }
 
 pub(crate) async fn check_discord_route_at(proxy: SocketAddr) -> Result<()> {

@@ -1,9 +1,9 @@
 //! Local SOCKS client data path: authenticated gateway tunnels and request forwarding.
 use crate::{
     policy::allowed_tcp_destination,
-    session,
+    session::{self, TunnelKind},
     socks::{read_socks_reply, read_socks_request, reply, socks_request_target},
-    udp::{valid_socks_udp_packet, write_frame, FrameReader},
+    udp::{valid_socks_udp_packet, write_frame, FrameReader, UDP_RECV_BUF},
     voice, Config, ContextExt, Result, AUTH_HANDSHAKE_TIMEOUT, DESTINATION_CONNECT_TIMEOUT,
     SOCKS_HANDSHAKE_TIMEOUT, TCP_COPY_BUFFER_SIZE, TLS_HANDSHAKE_TIMEOUT,
 };
@@ -118,8 +118,8 @@ impl Gateway {
         .context("TLS gateway handshake")
     }
 
-    async fn hello(&self, version: u8) -> Result<Vec<u8>> {
-        let mut hello = vec![b'D', b'M', b'P', b'X', version];
+    async fn hello(&self, kind: TunnelKind) -> Result<Vec<u8>> {
+        let mut hello = vec![b'D', b'M', b'P', b'X', kind as u8];
         write_string(&mut hello, &self.token).await?;
         Ok(hello)
     }
@@ -127,7 +127,7 @@ impl Gateway {
     /// Opens an authenticated control session and returns its ID.
     pub(crate) async fn control(&self) -> Result<(GatewayStream, session::Id)> {
         let mut remote = self.connect().await?;
-        let hello = self.hello(2).await?;
+        let hello = self.hello(TunnelKind::Control).await?;
         let mut id = [0; 16];
         tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, async {
             remote.write_all(&hello).await?;
@@ -153,7 +153,7 @@ pub(crate) async fn handle(
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let local = stream.local_addr()?;
-    let mut hello = gateway.hello(3).await?;
+    let mut hello = gateway.hello(TunnelKind::Data).await?;
     hello.extend_from_slice(&session_id);
     relay(
         &mut stream,
@@ -351,7 +351,7 @@ where
     };
     let mut peer = (declared.port() != 0 && admits(declared)).then_some(declared);
     let (mut reader, mut writer) = tokio::io::split(remote);
-    let mut datagram = vec![0; 1501];
+    let mut datagram = vec![0; UDP_RECV_BUF];
     let mut frames = FrameReader::default();
     let mut control = [0u8; 1];
     loop {

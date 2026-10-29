@@ -7,6 +7,8 @@ use std::net::{IpAddr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_FRAME: usize = 1500;
+/// One extra byte detects truncated datagrams: anything that fills it is too long.
+pub(crate) const UDP_RECV_BUF: usize = MAX_FRAME + 1;
 /// A TLS stream yields at most one 16 KiB record per read.
 const FRAME_READ_BUFFER: usize = 16 * 1024;
 

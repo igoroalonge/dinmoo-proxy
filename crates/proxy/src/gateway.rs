@@ -1,10 +1,11 @@
 //! Gateway server: TLS accept loop, tunnel authentication and SOCKS relay.
 use crate::{
     policy::{allowed_destination, allowed_tcp_destination, is_public_ip, parse_media_targets},
-    protection, session,
+    protection,
+    session::{self, TunnelKind},
     socks::{read_socks_request, reply, reply_bound, socks_request_target, Address},
     tunnel::read_string,
-    udp::{forward_udp_response, parse_socks_udp, FrameReader},
+    udp::{forward_udp_response, parse_socks_udp, FrameReader, UDP_RECV_BUF},
     voice, Config, ContextExt, Result, AUTH_HANDSHAKE_TIMEOUT, DESTINATION_CONNECT_TIMEOUT,
     SOCKS_HANDSHAKE_TIMEOUT, TCP_COPY_BUFFER_SIZE, TLS_HANDSHAKE_TIMEOUT,
 };
@@ -227,14 +228,14 @@ pub(crate) async fn handle_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>
 ) -> Result<()> {
     // Scanners fail before authentication constantly, so those failures share one rate
     // limit; an authenticated session's failure is rare and always logged.
-    let (stream, version) = open_gateway_connection(stream, cfg)
+    let (stream, kind) = open_gateway_connection(stream, cfg)
         .await
         .inspect_err(|error| {
             if !benign(&**error) {
                 HANDSHAKE_ERRORS.log(format_args!("session: {error:#}"));
             }
         })?;
-    serve_gateway_connection(stream, version, cfg, peer)
+    serve_gateway_connection(stream, kind, cfg, peer)
         .await
         .inspect_err(|error| {
             if !benign(&**error) && !error.is::<Denied>() {
@@ -243,11 +244,11 @@ pub(crate) async fn handle_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>
         })
 }
 
-/// TLS accept and DMPX authentication; returns the protocol version.
+/// TLS accept and DMPX authentication.
 async fn open_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     cfg: &Config,
-) -> Result<(TlsStream<S>, u8)> {
+) -> Result<(TlsStream<S>, TunnelKind)> {
     let acceptor = cfg
         .server_tls
         .as_ref()
@@ -256,24 +257,26 @@ async fn open_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .context("TLS client handshake timed out")?
         .context("TLS client handshake")?;
-    let version = tokio::time::timeout(
+    let kind = tokio::time::timeout(
         AUTH_HANDSHAKE_TIMEOUT,
         authenticate_gateway(&mut stream, cfg),
     )
     .await
     .context("gateway authentication timed out")??;
-    Ok((stream, version))
+    Ok((stream, kind))
 }
 
 async fn serve_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: TlsStream<S>,
-    version: u8,
+    kind: TunnelKind,
     cfg: &Config,
     peer: IpAddr,
 ) -> Result<()> {
-    match version {
-        2 => session::serve_control(&mut stream, cfg.sessions.clone(), peer).await,
-        3 => {
+    match kind {
+        TunnelKind::Control => {
+            session::serve_control(&mut stream, cfg.sessions.clone(), peer).await
+        }
+        TunnelKind::Data => {
             let mut id = [0; 16];
             tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, stream.read_exact(&mut id)).await??;
             let session = match cfg.sessions.attach(id, peer) {
@@ -291,25 +294,24 @@ async fn serve_gateway_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 result = handle_socks(&mut stream, cfg) => result,
             }
         }
-        // Legacy clients have no control channel and retain per-tunnel expiry.
-        1 => {
+        TunnelKind::Legacy => {
             let (mut stream, activity) = protection::ActivityStream::new(stream);
             protection::guard_idle(handle_socks(&mut stream, cfg), activity, cfg.sessions.idle)
                 .await
         }
-        _ => unreachable!(),
     }
 }
 
 async fn authenticate_gateway<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     cfg: &Config,
-) -> Result<u8> {
+) -> Result<TunnelKind> {
     let mut magic = [0u8; 5];
     stream.read_exact(&mut magic).await?;
-    if &magic[..4] != b"DMPX" || !(1..=3).contains(&magic[4]) {
-        bail!("invalid protocol header");
-    }
+    let kind = match TunnelKind::try_from(magic[4]) {
+        Ok(kind) if &magic[..4] == b"DMPX" => kind,
+        _ => bail!("invalid protocol header"),
+    };
     let token = read_string(stream).await?;
     if !cfg.token.is_empty()
         && (token.len() != cfg.token.len()
@@ -319,7 +321,7 @@ async fn authenticate_gateway<S: AsyncRead + AsyncWrite + Unpin>(
         bail!("invalid token");
     }
     stream.write_all(&[1]).await?;
-    Ok(magic[4])
+    Ok(kind)
 }
 
 async fn handle_socks<S: AsyncRead + AsyncWrite + Unpin>(
@@ -542,8 +544,8 @@ async fn relay_udp_gateway<S: AsyncRead + AsyncWrite + Unpin>(
     cfg: &Config,
 ) -> Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let mut buffer_v4 = vec![0; 1501];
-    let mut buffer_v6 = vec![0; 1501];
+    let mut buffer_v4 = vec![0; UDP_RECV_BUF];
+    let mut buffer_v6 = vec![0; UDP_RECV_BUF];
     let mut replies = ReplyFilter::default();
     let mut frames = FrameReader::default();
     loop {

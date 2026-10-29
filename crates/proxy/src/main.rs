@@ -22,7 +22,12 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     ClientConfig, RootCertStore, ServerConfig,
 };
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    env,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::Arc,
+    time::Duration,
+};
 use tokio_rustls::TlsAcceptor;
 #[cfg(test)]
 mod bench;
@@ -47,6 +52,13 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DESTINATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Where the client services listen and where Discord is pointed.
+const DEFAULT_SOCKS_LISTEN: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1080));
+
+fn discord_proxy_url(listen: SocketAddr) -> String {
+    format!("socks5://{listen}")
+}
 
 #[derive(Clone)]
 struct Config {
@@ -122,7 +134,7 @@ async fn run(first: String, mut args: std::iter::Skip<env::Args>) -> Result<()> 
         if enabled {
             desktop::set_client_enabled(true)?;
             desktop::wait_for_discord_route().await?;
-            desktop::restart_discord("socks5://127.0.0.1:1080").await?;
+            desktop::restart_discord(&discord_proxy_url(DEFAULT_SOCKS_LISTEN)).await?;
         } else {
             desktop::disable_proxy()?;
         }
@@ -160,26 +172,20 @@ async fn run(first: String, mut args: std::iter::Skip<env::Args>) -> Result<()> 
         return desktop::uninstall();
     }
     if first == "discord" {
-        return desktop::restart_discord(
-            args.next().as_deref().unwrap_or("socks5://127.0.0.1:1080"),
-        )
-        .await;
+        let proxy = args
+            .next()
+            .unwrap_or_else(|| discord_proxy_url(DEFAULT_SOCKS_LISTEN));
+        return desktop::restart_discord(&proxy).await;
     }
     let mode = first;
     if mode != "client" && mode != "gateway" {
         bail!("unknown mode '{mode}'. Use --help.");
     }
-    let listen: SocketAddr = args
-        .next()
-        .unwrap_or_else(|| {
-            if mode == "gateway" {
-                "0.0.0.0:8443"
-            } else {
-                "127.0.0.1:1080"
-            }
-            .into()
-        })
-        .parse()?;
+    let listen: SocketAddr = match args.next() {
+        Some(listen) => listen.parse()?,
+        None if mode == "gateway" => "0.0.0.0:8443".parse()?,
+        None => DEFAULT_SOCKS_LISTEN,
+    };
     if mode == "client" && !listen.ip().is_loopback() {
         bail!("local SOCKS listener must bind to a loopback address");
     }
@@ -432,6 +438,14 @@ mod tests {
                 "{mode}"
             );
         }
+    }
+
+    #[test]
+    fn discord_is_pointed_at_the_default_client_listener() {
+        assert_eq!(
+            discord_proxy_url(DEFAULT_SOCKS_LISTEN),
+            "socks5://127.0.0.1:1080"
+        );
     }
 
     #[test]
