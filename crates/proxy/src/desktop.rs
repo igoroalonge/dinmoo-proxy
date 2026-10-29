@@ -341,11 +341,7 @@ pub(crate) fn install_user_service(binary: &std::path::Path, token: &str) -> Res
             let _ = std::fs::remove_file(envfile);
             bail!("could not restrict access to the Windows client credential file");
         }
-        let command = format!(
-            "@echo off\r\nfor /f \"usebackq tokens=1,* delims==\" %%A in (\"%LOCALAPPDATA%\\Programs\\DinmooProxy\\client.env\") do set \"%%A=%%B\"\r\n\"{}\" client\r\n",
-            binary.display()
-        );
-        std::fs::write(&cmd, command)?;
+        std::fs::write(&cmd, startup_command(binary))?;
         if cmd.with_extension("cmd.disabled").exists() {
             std::fs::remove_file(cmd.with_extension("cmd.disabled"))?;
         }
@@ -375,28 +371,60 @@ pub(crate) fn client_service_running() -> Result<bool> {
         command
     };
     #[cfg(target_os = "windows")]
-    let mut command = client_processes(
-        &env::current_exe()?,
-        "if (Get-Client) { exit 0 } else { exit 1 }",
-    );
+    let mut command = client_processes("if (Get-Client) { exit 0 } else { exit 1 }")?;
     Ok(command.output()?.status.success())
 }
 
-/// Runs `script` with `Get-Client` listing the other client processes of `exe`.
+/// Runs `script` with `Get-Client` listing the other client processes of `client_executables`.
 #[cfg(target_os = "windows")]
-fn client_processes(exe: &std::path::Path, script: &str) -> std::process::Command {
+fn client_processes(script: &str) -> Result<std::process::Command> {
     let mut command = std::process::Command::new("powershell.exe");
     command
         .args(["-NoProfile", "-NonInteractive", "-Command"])
-        .arg(format!("$ErrorActionPreference='Stop'; function Get-Client {{ Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -eq $env:DINMOO_CLIENT_EXE -and $_.CommandLine -match '\\sclient(\\s|$)' -and $_.ProcessId -ne [int]$env:DINMOO_CALLER_PID }} }}; {script}"))
-        .env("DINMOO_CLIENT_EXE", exe)
+        .arg(format!("$ErrorActionPreference='Stop'; function Get-Client {{ $exes=$env:DINMOO_CLIENT_EXE.Split([char]10); Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -in $exes -and $_.CommandLine -match '\\sclient(\\s|$)' -and $_.ProcessId -ne [int]$env:DINMOO_CALLER_PID }} }}; {script}"))
+        .env("DINMOO_CLIENT_EXE", client_executables()?)
         .env("DINMOO_CALLER_PID", std::process::id().to_string());
-    command
+    Ok(command)
+}
+
+/// Newline-separated paths a client may run from: the installed binary, this binary,
+/// and whatever the startup script names (`install-local` can install from anywhere).
+#[cfg(target_os = "windows")]
+fn client_executables() -> Result<String> {
+    let startup = startup_script()?;
+    let mut paths = vec![
+        install_directory()?
+            .join("dinmoo-proxy.exe")
+            .display()
+            .to_string(),
+        env::current_exe()?.display().to_string(),
+    ];
+    for script in [startup.with_extension("cmd.disabled"), startup] {
+        if let Ok(body) = std::fs::read_to_string(script) {
+            paths.extend(startup_client(&body).map(str::to_owned));
+        }
+    }
+    Ok(paths.join("\n"))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn startup_command(binary: &std::path::Path) -> String {
+    format!(
+        "@echo off\r\nfor /f \"usebackq tokens=1,* delims==\" %%A in (\"%LOCALAPPDATA%\\Programs\\DinmooProxy\\client.env\") do set \"%%A=%%B\"\r\n\"{}\" client\r\n",
+        binary.display()
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn startup_client(script: &str) -> Option<&str> {
+    script
+        .lines()
+        .find_map(|line| line.strip_prefix('"')?.strip_suffix("\" client"))
 }
 
 #[cfg(target_os = "windows")]
-fn stop_clients(exe: &std::path::Path) -> Result<()> {
-    let status = client_processes(exe, "Get-Client | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Wait-Process -Id $_.ProcessId -Timeout 5 -ErrorAction SilentlyContinue }; if (Get-Client) { exit 1 }").status()?;
+fn stop_clients() -> Result<()> {
+    let status = client_processes("Get-Client | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Wait-Process -Id $_.ProcessId -Timeout 5 -ErrorAction SilentlyContinue }; if (Get-Client) { exit 1 }")?.status()?;
     if !status.success() {
         bail!("could not stop the client process");
     }
@@ -527,7 +555,7 @@ pub(crate) fn set_client_enabled(enabled: bool) -> Result<()> {
             if startup.is_file() {
                 std::fs::rename(&startup, disabled)?;
             }
-            stop_clients(&env::current_exe()?)?;
+            stop_clients()?;
         }
     }
     Ok(())
@@ -572,9 +600,9 @@ fn remove_installation() -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
+        stop_clients()?;
         let install = install_directory()?;
         let exe = install.join("dinmoo-proxy.exe");
-        stop_clients(&exe)?;
         let startup = startup_script()?;
         let _ = std::fs::remove_file(startup.with_extension("cmd.disabled"));
         let _ = std::fs::remove_file(startup);
@@ -710,7 +738,15 @@ pub(crate) fn restart_discord(proxy: &str) -> Result<()> {
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned(),
     ];
     // A fresh key per launch, so a pin learned from an earlier launch is useless.
-    let identity = voice::identity::rotate(&voice::identity::identity_directory()?)?;
+    let identity = match voice::identity::identity_directory()
+        .and_then(|directory| voice::identity::rotate(&directory))
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = launch_discord_direct();
+            return Err(error);
+        }
+    };
     discord_args.push(format!(
         "--ignore-certificate-errors-spki-list={}",
         identity.spki_pin
@@ -760,4 +796,17 @@ pub(crate) fn restart_discord(proxy: &str) -> Result<()> {
         bail!("Discord launching is unsupported on this operating system");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_script_names_the_client_it_runs() {
+        let binary = r"C:\Users\Ada Lovelace\tools\dinmoo-proxy.exe";
+        let script = startup_command(std::path::Path::new(binary));
+        assert_eq!(startup_client(&script), Some(binary));
+        assert_eq!(startup_client("@echo off\r\n"), None);
+    }
 }

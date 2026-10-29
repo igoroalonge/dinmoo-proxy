@@ -74,6 +74,22 @@ fi
 [ ! -e "$test_dir/launch" ]
 grep -q 'could not check whether Discord has exited' "$test_dir/error"
 
+# A voice identity that cannot rotate must not leave Discord stopped.
+voice="$HOME/.config/dinmoo-proxy/voice"
+chmod 755 "$voice"
+rm -f "$test_dir/events"
+if "$binary" discord 2>"$test_dir/error"; then
+    fail 'discord ignored a voice identity error'
+fi
+wait_for_launch
+assert_before stop launch
+grep -q 'voice identity directory must have mode 0700' "$test_dir/error" || fail 'identity error not reported'
+if grep -q -e '--proxy-server=' -e '--ignore-certificate-errors-spki-list=' "$test_dir/launch"; then
+    fail 'Discord was relaunched through the proxy after the identity failed to rotate'
+fi
+chmod 700 "$voice"
+rm "$test_dir/launch"
+
 # A Discord carrying the pin must be gone before the client releases its port.
 cat >"$test_dir/bin/launchctl" <<'SH'
 #!/bin/sh
@@ -104,5 +120,5 @@ wait_for_launch
 assert_before stop 'launchctl bootout'
 assert_before 'launchctl bootout' launch
 [ ! -e "$plist" ] || fail 'uninstall left the launch agent'
-echo 'PASS: Discord exit is awaited before launch; each launch rotates the pin; process errors prevent relaunch'
+echo 'PASS: Discord exit is awaited before launch; each launch rotates the pin; process errors prevent relaunch; a failed rotation relaunches Discord directly'
 echo 'PASS: off and uninstall stop Discord before the client and relaunch it directly'

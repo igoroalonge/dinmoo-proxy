@@ -9,7 +9,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use x509_parser::{extensions::GeneralName, parse_x509_certificate, pem::Pem};
 
@@ -55,34 +55,23 @@ impl Store {
     }
 }
 
+/// Digest of the identity file: sizes and coarse (NTFS) timestamps repeat across rotations.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Stamp {
-    len: u64,
-    modified: Option<SystemTime>,
-    inode: u64,
-}
+struct Stamp([u8; 32]);
 
 impl Stamp {
     fn of(path: &Path) -> io::Result<Option<Self>> {
-        match fs::symlink_metadata(path) {
-            Ok(meta) => Ok(Some(Self::from(&meta))),
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(Self::from(bytes.as_slice()))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
     }
 }
 
-impl From<&fs::Metadata> for Stamp {
-    fn from(meta: &fs::Metadata) -> Self {
-        #[cfg(unix)]
-        let inode = std::os::unix::fs::MetadataExt::ino(meta);
-        #[cfg(not(unix))]
-        let inode = 0;
-        Self {
-            len: meta.len(),
-            modified: meta.modified().ok(),
-            inode,
-        }
+impl From<&[u8]> for Stamp {
+    fn from(bytes: &[u8]) -> Self {
+        Self(Sha256::digest(bytes).into())
     }
 }
 
@@ -126,9 +115,10 @@ fn load(directory: &Path) -> crate::Result<(VoiceIdentity, Option<Stamp>)> {
 fn read_stored(directory: &Path) -> crate::Result<Option<(VoiceIdentity, Option<Stamp>)>> {
     let path = directory.join(IDENTITY);
     match check_private_file(&path) {
-        Ok(meta) => {
-            let identity = identity_from_pem(&fs::read(path)?)?;
-            return Ok(Some((identity, Some(Stamp::from(&meta)))));
+        Ok(()) => {
+            let bytes = fs::read(path)?;
+            let identity = identity_from_pem(&bytes)?;
+            return Ok(Some((identity, Some(Stamp::from(bytes.as_slice())))));
         }
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
         Err(_) => {}
@@ -159,8 +149,7 @@ fn generate(directory: &Path) -> crate::Result<(VoiceIdentity, Option<Stamp>)> {
         let _ = fs::remove_file(directory.join(legacy));
         let _ = fs::remove_file(directory.join(format!(".{legacy}.tmp")));
     }
-    let meta = fs::symlink_metadata(directory.join(IDENTITY))?;
-    Ok((identity, Some(Stamp::from(&meta))))
+    Ok((identity, Some(Stamp::from(contents.as_bytes()))))
 }
 
 fn pem(label: &str, der: &[u8]) -> String {
@@ -282,7 +271,7 @@ fn create_private_directory(directory: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-fn check_private_file(path: &Path) -> io::Result<fs::Metadata> {
+fn check_private_file(path: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if !meta.is_file() || meta.file_type().is_symlink() {
         return Err(io::Error::other(
@@ -296,7 +285,7 @@ fn check_private_file(path: &Path) -> io::Result<fs::Metadata> {
             return Err(io::Error::other("voice identity files must have mode 0600"));
         }
     }
-    Ok(meta)
+    Ok(())
 }
 fn publish(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let temporary = directory.join(format!(".{name}.tmp"));
@@ -316,8 +305,11 @@ fn publish(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(temporary, directory.join(name))?;
+    // The file is already replaced; some network and FUSE homes cannot sync a directory.
     #[cfg(unix)]
-    fs::File::open(directory)?.sync_all()?;
+    if let Err(error) = fs::File::open(directory).and_then(|directory| directory.sync_all()) {
+        eprintln!("voice identity directory sync failed: {error}");
+    }
     Ok(())
 }
 /// An advisory lock the OS releases when the file is dropped or the process dies.
@@ -512,7 +504,7 @@ mod tests {
         {
             fs::File::open(&legacy)
                 .unwrap()
-                .set_modified(SystemTime::now() - Duration::from_secs(120))
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
                 .unwrap();
             drop(lock(&path, LOCK_TIMEOUT).unwrap());
             assert!(!legacy.exists());
@@ -551,6 +543,42 @@ mod tests {
         assert_eq!(reloaded.spki_pin, rotated.spki_pin);
         assert_ne!(reloaded.spki_pin, first.spki_pin);
         assert!(Arc::ptr_eq(&reloaded, &store.current().await.unwrap()));
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[tokio::test]
+    async fn store_reloads_identity_with_same_size_and_timestamp() {
+        // NTFS timestamps are coarse and generated identities often share a length.
+        let mut by_len = std::collections::HashMap::new();
+        let (original, replacement) = loop {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let params = rcgen::CertificateParams::new(vec!["*.discord.media".into()]).unwrap();
+            let cert = params.self_signed(&key).unwrap();
+            let contents =
+                pem("CERTIFICATE", cert.der()) + &pem("PRIVATE KEY", &key.serialize_der());
+            if let Some(other) = by_len.insert(contents.len(), contents.clone()) {
+                break (other, contents);
+            }
+        };
+        let path = directory();
+        create_private_directory(&path).unwrap();
+        publish(&path, IDENTITY, original.as_bytes()).unwrap();
+        let store = Store::open(path.clone()).unwrap();
+        let first = store.current().await.unwrap();
+        let file = path.join(IDENTITY);
+        let before = fs::metadata(&file).unwrap();
+        fs::write(&file, &replacement).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        let reloaded = store.current().await.unwrap();
+        assert_ne!(reloaded.spki_pin, first.spki_pin);
+        assert_eq!(
+            reloaded.spki_pin,
+            identity_from_pem(replacement.as_bytes()).unwrap().spki_pin
+        );
         fs::remove_dir_all(path).unwrap();
     }
     #[tokio::test]
