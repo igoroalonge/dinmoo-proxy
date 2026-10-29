@@ -53,6 +53,7 @@ struct Config {
     upstream: Option<String>,
     token: String,
     client_tls: Arc<ClientConfig>,
+    upstream_tls: Arc<ClientConfig>,
     server_tls: Option<TlsAcceptor>,
     media_targets: policy::MediaTargets,
     dns: Arc<gateway::DnsCache>,
@@ -60,10 +61,28 @@ struct Config {
     sessions: session::Registry,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let first = args.next().unwrap_or_else(|| "client".into());
+    runtime(&first)?.block_on(run(first, args))
+}
+
+fn runtime(mode: &str) -> io::Result<tokio::runtime::Runtime> {
+    let mut builder = match mode {
+        // spawn_blocking (getaddrinfo) panics when no blocking thread can be created;
+        // stay well inside the gateway unit's TasksMax.
+        "gateway" => {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.max_blocking_threads(32);
+            builder
+        }
+        "media" => tokio::runtime::Builder::new_multi_thread(),
+        _ => tokio::runtime::Builder::new_current_thread(),
+    };
+    builder.enable_all().build()
+}
+
+async fn run(first: String, mut args: std::iter::Skip<env::Args>) -> Result<()> {
     if first == "gateway-sessions" {
         println!("{}", session::admin::request("LIST").await?);
         return Ok(());
@@ -168,16 +187,11 @@ async fn main() -> Result<()> {
     if !token.is_empty() && (token.len() < 32 || token.len() > 1024) {
         bail!("DINMOO_PROXY_TOKEN must be 32 to 1024 bytes");
     }
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    if let Ok(root_path) = env::var("DINMOO_TLS_ROOT_DER") {
-        root_store.add(CertificateDer::from(std::fs::read(root_path)?))?;
-    }
-    let client_tls = Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    );
+    let extra_root = match env::var("DINMOO_TLS_ROOT_DER") {
+        Ok(path) => Some(CertificateDer::from(std::fs::read(path)?)),
+        Err(_) => None,
+    };
+    let (client_tls, upstream_tls) = tls_clients(extra_root)?;
     let server_tls = if mode == "gateway" {
         let cert_paths = env::var("DINMOO_TLS_CERT_DER").context(
             "set DINMOO_TLS_CERT_DER to comma-separated DER certificate files (leaf first)",
@@ -192,11 +206,7 @@ async fn main() -> Result<()> {
             bail!("DINMOO_TLS_CERT_DER must include a leaf certificate");
         }
         let key = PrivateKeyDer::try_from(std::fs::read(key_path)?)?;
-        Some(TlsAcceptor::from(Arc::new(
-            ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)?,
-        )))
+        Some(TlsAcceptor::from(Arc::new(gateway_tls(certs, key)?)))
     } else {
         None
     };
@@ -223,6 +233,7 @@ async fn main() -> Result<()> {
         },
         token,
         client_tls,
+        upstream_tls,
         server_tls,
         media_targets: policy::MediaTargets::new(policy::parse_media_targets(
             &env::var("DINMOO_MEDIA_TARGETS").unwrap_or_default(),
@@ -261,6 +272,38 @@ async fn main() -> Result<()> {
     gateway::serve(config, settings, max_sessions).await
 }
 
+/// Returns (client trust for the dinmoo gateway, trust for Discord upstreams). A test or
+/// private root extends only the former.
+fn tls_clients(
+    extra_root: Option<CertificateDer<'static>>,
+) -> Result<(Arc<ClientConfig>, Arc<ClientConfig>)> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let upstream = ClientConfig::builder()
+        .with_root_certificates(roots.clone())
+        .with_no_client_auth();
+    if let Some(root) = extra_root {
+        roots.add(root)?;
+    }
+    let gateway = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok((Arc::new(gateway), Arc::new(upstream)))
+}
+
+fn gateway_tls(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig> {
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    // Stateless TLS 1.3 tickets survive server cache churn. Resumed connections still
+    // authenticate with DMPX, and early data stays disabled (no replayable 0-RTT).
+    config.ticketer = rustls::crypto::ring::Ticketer::new()?;
+    Ok(config)
+}
+
 fn configured_max_sessions() -> Result<usize> {
     match env::var("DINMOO_MAX_SESSIONS") {
         Ok(value) => parse_max_sessions(&value),
@@ -288,7 +331,8 @@ pub(crate) fn test_config() -> Config {
         listen: "127.0.0.1:0".parse().unwrap(),
         upstream: None,
         token: "test-token-for-in-memory-protocol".into(),
-        client_tls,
+        client_tls: client_tls.clone(),
+        upstream_tls: client_tls,
         server_tls: None,
         media_targets: Default::default(),
         dns: Default::default(),
@@ -300,6 +344,91 @@ pub(crate) fn test_config() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::{pki_types::ServerName, HandshakeKind};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        runtime::RuntimeFlavor,
+    };
+    use tokio_rustls::TlsConnector;
+
+    const FIXTURE_CERT: &[u8] = include_bytes!("../tests/fixtures/localhost-cert.der");
+    const FIXTURE_KEY: &[u8] = include_bytes!("../tests/fixtures/localhost-key.der");
+    const FIXTURE_CA: &[u8] = include_bytes!("../tests/fixtures/test-ca.der");
+
+    fn fixture_server() -> ServerConfig {
+        gateway_tls(
+            vec![CertificateDer::from(FIXTURE_CERT.to_vec())],
+            PrivateKeyDer::try_from(FIXTURE_KEY.to_vec()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Connects to `acceptor` in memory; returns the client's handshake kind.
+    async fn handshake(
+        acceptor: TlsAcceptor,
+        client: Arc<ClientConfig>,
+    ) -> std::io::Result<Option<HandshakeKind>> {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut tls = acceptor.accept(server_io).await?;
+            tls.write_u8(1).await?;
+            tls.flush().await?;
+            Ok::<_, std::io::Error>(tls)
+        });
+        let mut tls = TlsConnector::from(client)
+            .connect(ServerName::try_from("localhost").unwrap(), client_io)
+            .await?;
+        tls.read_u8().await?;
+        drop(server.await.unwrap()?);
+        Ok(tls.get_ref().1.handshake_kind())
+    }
+
+    #[tokio::test]
+    async fn gateway_tls_resumes_from_stateless_tickets_without_early_data() {
+        let mut server = fixture_server();
+        assert!(server.ticketer.enabled());
+        assert_eq!(server.max_early_data_size, 0);
+        // Without a server-side session cache, only tickets can resume.
+        server.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        let acceptor = TlsAcceptor::from(Arc::new(server));
+        let (gateway, _) = tls_clients(Some(CertificateDer::from(FIXTURE_CA.to_vec()))).unwrap();
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            kinds.push(handshake(acceptor.clone(), gateway.clone()).await.unwrap());
+        }
+        assert_eq!(
+            kinds,
+            [Some(HandshakeKind::Full), Some(HandshakeKind::Resumed)]
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_root_extends_only_the_gateway_trust() {
+        let acceptor = TlsAcceptor::from(Arc::new(fixture_server()));
+        let (gateway, upstream) =
+            tls_clients(Some(CertificateDer::from(FIXTURE_CA.to_vec()))).unwrap();
+        assert!(handshake(acceptor.clone(), gateway).await.is_ok());
+        assert!(handshake(acceptor.clone(), upstream).await.is_err());
+        let (gateway, _) = tls_clients(None).unwrap();
+        assert!(handshake(acceptor, gateway).await.is_err());
+    }
+
+    #[test]
+    fn each_mode_gets_its_own_runtime_flavor() {
+        for (mode, flavor) in [
+            ("client", RuntimeFlavor::CurrentThread),
+            ("status", RuntimeFlavor::CurrentThread),
+            ("gateway-sessions", RuntimeFlavor::CurrentThread),
+            ("gateway", RuntimeFlavor::MultiThread),
+            ("media", RuntimeFlavor::MultiThread),
+        ] {
+            assert_eq!(
+                runtime(mode).unwrap().handle().runtime_flavor(),
+                flavor,
+                "{mode}"
+            );
+        }
+    }
 
     #[test]
     fn session_capacity_is_bounded_and_rejects_invalid_values() {

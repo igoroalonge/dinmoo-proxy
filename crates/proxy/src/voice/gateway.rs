@@ -120,7 +120,7 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     let name = rustls::pki_types::ServerName::try_from(host.to_owned())?;
     let tls = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio_rustls::TlsConnector::from(cfg.client_tls.clone()).connect(name, remote),
+        tokio_rustls::TlsConnector::from(cfg.upstream_tls.clone()).connect(name, remote),
     )
     .await??;
     let url = format!("wss://{host}:{port}{path}");

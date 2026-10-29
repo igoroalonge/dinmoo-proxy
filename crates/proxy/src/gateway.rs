@@ -22,7 +22,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, UdpSocket},
     time::Instant,
 };
@@ -32,6 +32,7 @@ macro_rules! deny {
     ($($arg:tt)*) => { return Err(denied(format_args!($($arg)*))) };
 }
 
+const CLIENT_READ_BUFFER: usize = 16 * 1024;
 /// One maximum-size handshake record plus a few record headers of fragmentation.
 const CLIENT_HELLO_LIMIT: usize = 16 * 1024 + 4 * 5;
 const ACCEPT_BACKOFF: (Duration, Duration) = (Duration::from_millis(100), Duration::from_secs(1));
@@ -79,7 +80,7 @@ pub(crate) async fn serve(
             let _permit = permit;
             let result = async {
                 stream.set_nodelay(true)?;
-                handle_gateway_connection(stream, &cfg, peer.ip()).await
+                handle_gateway_connection(buffered(stream), &cfg, peer.ip()).await
             }
             .await;
             if let Err(error) = result {
@@ -89,6 +90,12 @@ pub(crate) async fn serve(
             }
         });
     }
+}
+
+/// rustls reads at most 4 KiB of TLS input per call; buffering beneath it turns a
+/// 16 KiB record into one `recv` instead of four or five.
+pub(crate) fn buffered(stream: TcpStream) -> BufReader<TcpStream> {
+    BufReader::with_capacity(CLIENT_READ_BUFFER, stream)
 }
 
 /// Accept errors never stop the gateway. Errors other than a failed pending connection
@@ -944,6 +951,51 @@ mod tests {
 
         client_task.await.unwrap().unwrap();
         assert!(gateway_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn loopback_gateway_serves_buffered_tls_sessions() {
+        let (server_tls, client_tls) = fixture_tls();
+        let mut config = test_config();
+        config.token.clear();
+        config.server_tls = Some(server_tls);
+        config.listen = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let listen = config.listen;
+        let settings = protection::Settings {
+            per_ip: 8,
+            per_minute: 120,
+            idle: Duration::from_secs(60),
+        };
+        let gateway = tokio::spawn(serve(Arc::new(config), settings, 8));
+        let tcp = loop {
+            match TcpStream::connect(listen).await {
+                Ok(tcp) => break tcp,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        let mut tls = TlsConnector::from(client_tls)
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        tls.write_all(b"DMPX\x01").await.unwrap();
+        write_string(&mut tls, "").await.unwrap();
+        assert_eq!(tls.read_u8().await.unwrap(), 1);
+        tls.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0; 2];
+        tls.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 3, 12];
+        request.extend_from_slice(b"evil.example");
+        request.extend_from_slice(&443u16.to_be_bytes());
+        tls.write_all(&request).await.unwrap();
+        assert_eq!(
+            read_socks_reply(&mut tls).await.unwrap(),
+            [5, 2, 0, 1, 0, 0, 0, 0, 0, 0]
+        );
+        gateway.abort();
     }
 
     #[tokio::test]

@@ -596,6 +596,7 @@ fn tcp_tunnel(tunnels: usize, mib_each_way: usize) -> Sample {
                         let (acceptor, session) = (acceptor.clone(), session.clone());
                         tokio::spawn(async move {
                             stream.set_nodelay(true).unwrap();
+                            let stream = gateway::buffered(stream);
                             let tls = acceptor.accept(stream).await.unwrap();
                             let mut stream = session::tracked_data(tls, &session);
                             let mut target = TcpStream::connect(echo_address).await.unwrap();
@@ -727,10 +728,13 @@ fn handshakes(
         .unwrap()
         .local_addr()
         .unwrap();
+    let mut server = (*server).clone();
+    // Stateless session tickets, as `crate::gateway_tls` configures them in production.
+    server.ticketer = rustls::crypto::ring::Ticketer::new().unwrap();
     let mut config = crate::test_config();
     config.token.clear();
     config.listen = listen;
-    config.server_tls = Some(TlsAcceptor::from(server));
+    config.server_tls = Some(TlsAcceptor::from(Arc::new(server)));
     let settings = protection::Settings {
         per_ip: 4096,
         per_minute: 10_000,
@@ -1103,7 +1107,7 @@ fn bench_socks_udp_frames() {
             address_tx.send(listener.local_addr().unwrap()).unwrap();
             let (stream, _) = listener.accept().await.unwrap();
             stream.set_nodelay(true).unwrap();
-            let tls = acceptor.accept(stream).await.unwrap();
+            let tls = acceptor.accept(gateway::buffered(stream)).await.unwrap();
             let (mut stream, _activity) = protection::ActivityStream::new(tls);
             let (mut reader, _writer) = tokio::io::split(&mut stream);
             let mut frames = FrameReader::default();
