@@ -27,6 +27,19 @@ x509-parser = { version = "0.18", features = ["verify"] }
 tun = { version = "0.8", features = ["async"] }
 ipstack = "=1.0.1"
 
+# Voice peer ownership checks (src/peer.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
