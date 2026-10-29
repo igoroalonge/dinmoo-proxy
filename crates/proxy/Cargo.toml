@@ -27,6 +27,10 @@ x509-parser = { version = "0.18", features = ["verify"] }
 tun = { version = "0.8", features = ["async"] }
 ipstack = "=1.0.1"
 
+# SO_EXCLUSIVEADDRUSE for the local SOCKS listener.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
