@@ -50,7 +50,14 @@ if ($assetUri.Scheme -ne 'https' -or $assetUri.Host -ne 'github.com' -or -not $a
 Get-BoundedDownload $assetUri.AbsoluteUri $temp 52428800
 $actual = (Get-FileHash -Algorithm SHA256 $temp).Hash.ToLowerInvariant()
 if ($actual -ne $asset.sha256.ToLowerInvariant()) { Remove-Item $temp -Force; throw 'Binary checksum mismatch' }
-$target = Join-Path $bin 'dinmoo-proxy.exe'
+# Win32_Process reports ExecutablePath with backslashes; $bin is built with a forward slash.
+$target = [System.IO.Path]::GetFullPath((Join-Path $bin 'dinmoo-proxy.exe'))
+# A Discord launched with the voice pin must not outlive the client's SOCKS listener.
+$session = (Get-Process -Id $PID).SessionId
+$discord = { Get-Process -Name Discord -ErrorAction SilentlyContinue | Where-Object SessionId -eq $session }
+& $discord | Stop-Process -Force -ErrorAction SilentlyContinue
+for ($i = 0; $i -lt 50 -and (& $discord); $i++) { Start-Sleep -Milliseconds 100 }
+if (& $discord) { Remove-Item $temp -Force; throw 'Discord did not exit; close Discord and run the installer again.' }
 $running = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $target })
 foreach ($process in $running) { Stop-Process -Id $process.ProcessId -Force; Wait-Process -Id $process.ProcessId -ErrorAction SilentlyContinue }
 Move-Item -Force $temp $target

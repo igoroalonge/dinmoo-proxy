@@ -64,7 +64,8 @@ rm "$test_dir/launch" "$test_dir/events"
 "$binary" discord
 wait_for_launch
 assert_before stop launch
-[ "$(pin)" != "$first_pin" ] || fail 'consecutive Discord launches reused the voice pin'
+second_pin=$(pin)
+[ "$second_pin" != "$first_pin" ] || fail 'consecutive Discord launches reused the voice pin'
 rm "$test_dir/launch"
 if DINMOO_RESTART_TEST_ERROR=yes "$binary" discord 2>"$test_dir/error"; then
     echo 'FAIL: a process-inspection error was ignored' >&2
@@ -72,4 +73,36 @@ if DINMOO_RESTART_TEST_ERROR=yes "$binary" discord 2>"$test_dir/error"; then
 fi
 [ ! -e "$test_dir/launch" ]
 grep -q 'could not check whether Discord has exited' "$test_dir/error"
+
+# A Discord carrying the pin must be gone before the client releases its port.
+cat >"$test_dir/bin/launchctl" <<'SH'
+#!/bin/sh
+printf 'launchctl %s\n' "$1" >>"$DINMOO_RESTART_TEST_DIR/events"
+SH
+chmod 755 "$test_dir/bin/launchctl"
+plist="$HOME/Library/LaunchAgents/com.dinmoo.proxy.plist"
+mkdir -p "$HOME/Library/LaunchAgents"
+: >"$plist"
+rm -f "$test_dir/events"
+if DINMOO_RESTART_TEST_ERROR=yes "$binary" off 2>"$test_dir/error"; then
+    fail 'off ignored a process-inspection error'
+fi
+if grep -q '^launch' "$test_dir/events"; then
+    fail 'off changed the client or launched Discord before Discord exited'
+fi
+rm -f "$test_dir/events"
+"$binary" off
+wait_for_launch
+assert_before stop 'launchctl disable'
+assert_before 'launchctl bootout' launch
+if grep -q -- '--ignore-certificate-errors-spki-list=' "$test_dir/launch"; then
+    fail 'off relaunched Discord with the voice pin'
+fi
+rm "$test_dir/launch" "$test_dir/events"
+"$binary" uninstall >/dev/null
+wait_for_launch
+assert_before stop 'launchctl bootout'
+assert_before 'launchctl bootout' launch
+[ ! -e "$plist" ] || fail 'uninstall left the launch agent'
 echo 'PASS: Discord exit is awaited before launch; each launch rotates the pin; process errors prevent relaunch'
+echo 'PASS: off and uninstall stop Discord before the client and relaunch it directly'
