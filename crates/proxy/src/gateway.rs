@@ -371,7 +371,8 @@ impl DnsCache {
             tokio::net::lookup_host((host, port)),
         )
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "destination DNS lookup timed out"))??
+        // A stalled resolver is an operator problem, so keep it out of the benign kinds.
+        .map_err(|_| io::Error::other("destination DNS lookup timed out"))??
         .map(|address| address.ip())
         .filter(|ip| is_public_ip(*ip))
         .collect();
