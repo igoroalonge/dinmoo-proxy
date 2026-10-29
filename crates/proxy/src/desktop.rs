@@ -655,8 +655,7 @@ pub(crate) fn restart_discord(proxy: &str) -> Result<()> {
         format!("--proxy-server={proxy}"),
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned(),
     ];
-    let identity =
-        voice::identity::VoiceIdentity::load_or_create(&voice::identity::identity_directory()?)?;
+    let identity = voice::identity::rotate(&voice::identity::identity_directory()?)?;
     discord_args.push(format!(
         "--ignore-certificate-errors-spki-list={}",
         identity.spki_pin

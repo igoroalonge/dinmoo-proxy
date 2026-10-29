@@ -68,7 +68,15 @@ pub(crate) async fn handle(
     })
     .await
     .context("data session handshake timed out")??;
-    proxy_socks_with_identity(&mut stream, &mut remote, cfg.voice_identity.as_deref()).await
+    let identity = match &cfg.voice_identity {
+        Some(store) => store
+            .current()
+            .await
+            .inspect_err(|error| eprintln!("voice bridge unavailable: {error}"))
+            .ok(),
+        None => None,
+    };
+    proxy_socks_with_identity(&mut stream, &mut remote, identity.as_deref()).await
 }
 
 #[cfg(test)]
@@ -237,9 +245,9 @@ mod tests {
             Arc::new(voice::identity::VoiceIdentity::load_or_create(&directory).unwrap());
         let mut roots = RootCertStore::empty();
         roots
-            .add(CertificateDer::from(
-                std::fs::read(directory.join("certificate.der")).unwrap(),
-            ))
+            .add(CertificateDer::from(voice::identity::certificate_der(
+                &directory,
+            )))
             .unwrap();
         let client_tls = Arc::new(
             ClientConfig::builder()

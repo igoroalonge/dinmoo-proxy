@@ -46,7 +46,7 @@ struct Config {
     client_tls: Arc<ClientConfig>,
     server_tls: Option<TlsAcceptor>,
     media_targets: Arc<tokio::sync::RwLock<Vec<SocketAddr>>>,
-    voice_identity: Option<Arc<voice::identity::VoiceIdentity>>,
+    voice_identity: Option<Arc<voice::identity::Store>>,
     sessions: session::Registry,
 }
 
@@ -218,9 +218,13 @@ async fn main() -> Result<()> {
             &env::var("DINMOO_MEDIA_TARGETS").unwrap_or_default(),
         )?)),
         voice_identity: if mode == "client" {
-            Some(Arc::new(voice::identity::VoiceIdentity::load_or_create(
-                &voice::identity::identity_directory()?,
-            )?))
+            match voice::identity::identity_directory().and_then(voice::identity::Store::open) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(error) => {
+                    eprintln!("voice bridge disabled: {error}");
+                    None
+                }
+            }
         } else {
             None
         },
