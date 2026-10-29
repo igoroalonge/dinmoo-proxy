@@ -46,7 +46,7 @@ struct Config {
     client_tls: Arc<ClientConfig>,
     server_tls: Option<TlsAcceptor>,
     media_targets: Arc<tokio::sync::RwLock<Vec<SocketAddr>>>,
-    voice_identity: Option<Arc<voice::identity::VoiceIdentity>>,
+    voice_identity: Option<Arc<voice::identity::Store>>,
     sessions: session::Registry,
 }
 
@@ -218,8 +218,8 @@ async fn main() -> Result<()> {
             &env::var("DINMOO_MEDIA_TARGETS").unwrap_or_default(),
         )?)),
         voice_identity: if mode == "client" {
-            Some(Arc::new(voice::identity::VoiceIdentity::load_or_create(
-                &voice::identity::identity_directory()?,
+            Some(Arc::new(voice::identity::Store::open(
+                voice::identity::identity_directory()?,
             )?))
         } else {
             None

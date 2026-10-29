@@ -68,7 +68,17 @@ pub(crate) async fn handle(
     })
     .await
     .context("data session handshake timed out")??;
-    proxy_socks_with_identity(&mut stream, &mut remote, cfg.voice_identity.as_deref()).await
+    let identity = match &cfg.voice_identity {
+        Some(store) => match store.current().await {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                eprintln!("voice identity unavailable; voice bridge disabled: {error}");
+                None
+            }
+        },
+        None => None,
+    };
+    proxy_socks_with_identity(&mut stream, &mut remote, identity.as_deref()).await
 }
 
 #[cfg(test)]

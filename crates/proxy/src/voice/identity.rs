@@ -201,6 +201,17 @@ impl Drop for IdentityLock {
     }
 }
 
+// TEMP shim: the identity stream replaces this with the real store.
+pub struct Store(Arc<VoiceIdentity>);
+impl Store {
+    pub fn open(directory: PathBuf) -> crate::Result<Self> {
+        Ok(Self(Arc::new(load_or_create(&directory)?)))
+    }
+    pub async fn current(&self) -> crate::Result<Arc<VoiceIdentity>> {
+        Ok(self.0.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
