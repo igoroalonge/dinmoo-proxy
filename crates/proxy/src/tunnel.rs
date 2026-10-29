@@ -208,6 +208,14 @@ where
         reply(local, 7).await?;
         return Ok(());
     }
+    let mut udp_source = None;
+    if command == 3 {
+        let Some(declared) = declared_udp_source(&host, port) else {
+            reply(local, 2).await?;
+            return Ok(());
+        };
+        udp_source = Some(declared);
+    }
     let mut identity = None;
     if let Some(store) = voice_identity.filter(|_| command == 1 && voice::allowed_host(&host)) {
         if !allowed_tcp_destination(&host, port) {
@@ -261,9 +269,8 @@ where
         local.write_all(&response).await?;
         return Ok(());
     }
-    if command == 3 {
-        let ip = host.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        return proxy_udp_associate(local, &mut remote, SocketAddr::new(ip, port)).await;
+    if let Some(declared) = udp_source {
+        return proxy_udp_associate(local, &mut remote, declared).await;
     }
     local.write_all(&response).await?;
     if let Some(identity) = identity {
@@ -306,9 +313,21 @@ async fn read_attach<R: AsyncRead + Unpin>(remote: &mut R) -> Result<()> {
     }
 }
 
+/// The source a UDP ASSOCIATE request declares, if any datagram could come from
+/// it: the relay listens on 127.0.0.1, so only IPv4 loopback or zeros can match.
+fn declared_udp_source(host: &str, port: u16) -> Option<SocketAddr> {
+    let ip = match host.parse::<IpAddr>() {
+        Ok(ip) => ip.to_canonical(),
+        Err(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    };
+    let deliverable = ip.is_unspecified() || matches!(ip, IpAddr::V4(ip) if ip.is_loopback());
+    deliverable.then_some(SocketAddr::new(ip, port))
+}
+
 /// Relays one UDP association. RFC 1928 section 6 lets the client declare the
 /// address it will send from, with zeros when it does not know it yet; zero parts
 /// match any loopback sender, and the first valid matching sender is pinned.
+/// `declared` comes from `declared_udp_source`.
 async fn proxy_udp_associate<L, R>(
     local: &mut L,
     remote: &mut R,
@@ -324,7 +343,6 @@ where
     };
     local.write_all(&bound_reply(relay)).await?;
 
-    let declared = SocketAddr::new(declared.ip().to_canonical(), declared.port());
     let admits = |source: SocketAddr| {
         source.ip().is_loopback()
             && (declared.ip().is_unspecified() || source.ip() == declared.ip())
@@ -703,6 +721,55 @@ mod tests {
         ));
         assert!(bridge.await.unwrap().is_ok());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Runs one local connection whose bytes are all sent up front; the gateway
+    /// must never be contacted. Returns everything the app received before EOF.
+    async fn answered_locally(sent: &[u8]) -> (Vec<u8>, Result<()>) {
+        let (mut app, mut local) = tokio::io::duplex(1024);
+        app.write_all(sent).await.unwrap();
+        let result = relay(
+            &mut local,
+            || -> std::future::Ready<Result<DuplexStream>> { panic!("gateway contacted") },
+            None,
+            None,
+            || async { false },
+        )
+        .await;
+        drop(local);
+        let mut received = Vec::new();
+        app.read_to_end(&mut received).await.unwrap();
+        (received, result)
+    }
+
+    #[tokio::test]
+    async fn apps_without_no_auth_are_refused_locally() {
+        let (received, result) = answered_locally(&[5, 1, 2]).await;
+        assert_eq!(received, [5, 0xff]);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn unsupported_and_internal_commands_are_refused_locally() {
+        for command in [2, voice::SOCKS_VOICE_COMMAND] {
+            let mut request = connect_request("voice.discord.media", 443);
+            request[1] = command;
+            let (received, result) = answered_locally(&[&[5, 1, 0], &request[..]].concat()).await;
+            assert_eq!(received, [5, 0, 5, 7, 0, 1, 0, 0, 0, 0, 0, 0], "{command}");
+            result.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_association_from_an_undeliverable_address_is_refused() {
+        // The relay listens on 127.0.0.1, so these senders could never match.
+        for declared in ["192.168.1.5:5000", "[::1]:5000", "[::ffff:10.0.0.1]:0"] {
+            let mut request = encode_socks_udp_packet(declared.parse().unwrap(), &[]);
+            request[..2].copy_from_slice(&[5, 3]);
+            let (received, result) = answered_locally(&[&[5, 1, 0], &request[..]].concat()).await;
+            assert_eq!(received, [5, 0, 5, 2, 0, 1, 0, 0, 0, 0, 0, 0], "{declared}");
+            result.unwrap();
+        }
     }
 
     /// Opens a UDP association declaring `declared` against a fake gateway.

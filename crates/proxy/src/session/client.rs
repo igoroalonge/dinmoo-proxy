@@ -72,7 +72,7 @@ fn bind(address: SocketAddr) -> io::Result<TcpListener> {
 fn exclusive_address_use(socket: &TcpSocket) -> io::Result<()> {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
-        setsockopt, WSAGetLastError, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        setsockopt, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
     };
     let enabled: i32 = 1;
     // SAFETY: `socket` owns the handle and `enabled` outlives the call.
@@ -86,7 +86,7 @@ fn exclusive_address_use(socket: &TcpSocket) -> io::Result<()> {
         )
     };
     if result == SOCKET_ERROR {
-        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -117,6 +117,7 @@ where
     F: FnMut() -> A,
     A: Future<Output = io::Result<(TcpStream, SocketAddr)>>,
 {
+    let mut failures = 0u32;
     loop {
         match accept().await {
             Ok(accepted) => return accepted,
@@ -128,8 +129,12 @@ where
                         | io::ErrorKind::Interrupted
                 ) => {}
             Err(error) => {
-                // Usually EMFILE/ENFILE: wait for descriptors instead of spinning.
-                eprintln!("local SOCKS accept: {error}");
+                // Usually EMFILE/ENFILE: wait for descriptors instead of spinning,
+                // logging about once a minute while it lasts.
+                if failures.is_multiple_of(240) {
+                    eprintln!("local SOCKS accept: {error}");
+                }
+                failures = failures.wrapping_add(1);
                 tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
             }
         }
@@ -137,8 +142,20 @@ where
 }
 
 pub async fn run(cfg: Arc<crate::Config>, maximum: usize) -> crate::Result<()> {
-    let gateway = Arc::new(Gateway::new(&cfg)?);
     let listener = bind_listener(cfg.listen).await;
+    let gateway = match Gateway::new(&cfg) {
+        Ok(gateway) => Arc::new(gateway),
+        Err(error) => {
+            // Exiting would release the port Discord trusts.
+            eprintln!(
+                "ERROR: invalid gateway endpoint: {error}. Closing every local SOCKS \
+                 connection until the client is reconfigured and restarted."
+            );
+            loop {
+                drop(next_connection(|| listener.accept()).await);
+            }
+        }
+    };
     eprintln!(
         "SOCKS listening on {}; the gateway session opens on first use",
         cfg.listen
@@ -490,6 +507,26 @@ mod tests {
         .await;
         assert_eq!(started.elapsed(), ACCEPT_ERROR_PAUSE);
         assert_eq!(peer, client.local_addr().unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_gateway_endpoint_keeps_the_listener_and_closes_connections() {
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut cfg = crate::test_config();
+        cfg.listen = address;
+        cfg.upstream = Some("api-proxy.dinmoo.com".into());
+        let client = tokio::spawn(run(Arc::new(cfg), 8));
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(!client.is_finished(), "the client must not exit");
+        app(move || {
+            assert!(held(address));
+            assert_closed(connect(address));
+        })
+        .await;
+        client.abort();
     }
 
     #[tokio::test(start_paused = true)]
