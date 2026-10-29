@@ -361,7 +361,11 @@ where
                 return Ok(());
             }
             result = socket.recv_from(&mut datagram) => {
-                let (length, source) = result?;
+                let (length, source) = match result {
+                    Ok(received) => received,
+                    Err(error) if crate::voice::wire::skippable(&error) => continue,
+                    Err(error) => return Err(error.into()),
+                };
                 let packet = &datagram[..length];
                 let accepted = admits(source)
                     && valid_socks_udp_packet(packet)

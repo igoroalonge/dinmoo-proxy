@@ -137,7 +137,7 @@ impl UdpRecords {
 /// Receive errors that report one event and leave the socket usable: Windows reports ICMP
 /// port unreachable for an earlier send on the next receive, and fails the receive of a
 /// datagram larger than the buffer with WSAEMSGSIZE after discarding it (Unix truncates).
-fn skippable(error: &io::Error) -> bool {
+pub(crate) fn skippable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused
