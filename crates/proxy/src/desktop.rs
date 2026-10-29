@@ -118,9 +118,9 @@ pub(crate) async fn install() -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     if target.exists() {
-        let updater = "$ErrorActionPreference='Stop'; Wait-Process -Id ([int]$env:DINMOO_PARENT_PID); $running=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $env:DINMOO_UPDATE_TARGET }); foreach ($p in $running) { Stop-Process -Id $p.ProcessId -Force; Wait-Process -Id $p.ProcessId -ErrorAction SilentlyContinue }; Move-Item -LiteralPath $env:DINMOO_UPDATE_FILE -Destination $env:DINMOO_UPDATE_TARGET -Force; & $env:DINMOO_UPDATE_TARGET install-local; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }";
+        let updater = format!("$ErrorActionPreference='Stop'; Wait-Process -Id ([int]$env:DINMOO_PARENT_PID) -ErrorAction SilentlyContinue; {STOP_DISCORD}; $running=@(Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -eq $env:DINMOO_UPDATE_TARGET }}); foreach ($p in $running) {{ Stop-Process -Id $p.ProcessId -Force; Wait-Process -Id $p.ProcessId -ErrorAction SilentlyContinue }}; Move-Item -LiteralPath $env:DINMOO_UPDATE_FILE -Destination $env:DINMOO_UPDATE_TARGET -Force; & $env:DINMOO_UPDATE_TARGET install-local; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}");
         std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", updater])
+            .args(["-NoProfile", "-NonInteractive", "-Command", &updater])
             .env("DINMOO_PARENT_PID", std::process::id().to_string())
             .env("DINMOO_UPDATE_FILE", &temp)
             .env("DINMOO_UPDATE_TARGET", &target)
@@ -130,11 +130,23 @@ pub(crate) async fn install() -> Result<()> {
         return Ok(());
     }
     std::fs::rename(temp, &target)?;
-    install_user_service(&target, &token)?;
     println!("Installed verified {key} binary at {}", target.display());
-    wait_for_discord_route().await?;
-    restart_discord("socks5://127.0.0.1:1080")?;
-    Ok(())
+    install_local(&target, &token).await
+}
+
+/// Restarts the client service and relaunches Discord through it.
+pub(crate) async fn install_local(binary: &std::path::Path, token: &str) -> Result<()> {
+    // A Discord carrying the voice pin must not outlive the client's SOCKS listener.
+    stop_discord()?;
+    let routed = async {
+        install_user_service(binary, token)?;
+        wait_for_discord_route().await
+    };
+    if let Err(error) = routed.await {
+        let _ = launch_discord_direct();
+        return Err(error);
+    }
+    restart_discord("socks5://127.0.0.1:1080")
 }
 
 async fn read_limited_body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
@@ -329,11 +341,7 @@ pub(crate) fn install_user_service(binary: &std::path::Path, token: &str) -> Res
             let _ = std::fs::remove_file(envfile);
             bail!("could not restrict access to the Windows client credential file");
         }
-        let command = format!(
-            "@echo off\r\nfor /f \"usebackq tokens=1,* delims==\" %%A in (\"%LOCALAPPDATA%\\Programs\\DinmooProxy\\client.env\") do set \"%%A=%%B\"\r\n\"{}\" client\r\n",
-            binary.display()
-        );
-        std::fs::write(&cmd, command)?;
+        std::fs::write(&cmd, startup_command(binary))?;
         if cmd.with_extension("cmd.disabled").exists() {
             std::fs::remove_file(cmd.with_extension("cmd.disabled"))?;
         }
@@ -363,33 +371,116 @@ pub(crate) fn client_service_running() -> Result<bool> {
         command
     };
     #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = std::process::Command::new("powershell.exe");
-        command.args(["-NoProfile", "-NonInteractive", "-Command", "if (Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $env:DINMOO_CLIENT_EXE -and $_.CommandLine -match '\\sclient(\\s|$)' }) { exit 0 } else { exit 1 }"]);
-        command.env("DINMOO_CLIENT_EXE", env::current_exe()?);
-        command
-    };
+    let mut command = client_processes("if (Get-Client) { exit 0 } else { exit 1 }")?;
     Ok(command.output()?.status.success())
 }
 
+/// Runs `script` with `Get-Client` listing the other client processes of `client_executables`.
+#[cfg(target_os = "windows")]
+fn client_processes(script: &str) -> Result<std::process::Command> {
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!("$ErrorActionPreference='Stop'; function Get-Client {{ $exes=$env:DINMOO_CLIENT_EXE.Split([char]10); Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -in $exes -and $_.CommandLine -match '\\sclient(\\s|$)' -and $_.ProcessId -ne [int]$env:DINMOO_CALLER_PID }} }}; {script}"))
+        .env("DINMOO_CLIENT_EXE", client_executables()?)
+        .env("DINMOO_CALLER_PID", std::process::id().to_string());
+    Ok(command)
+}
+
+/// Newline-separated paths a client may run from: the installed binary, this binary,
+/// and whatever the startup script names (`install-local` can install from anywhere).
+#[cfg(target_os = "windows")]
+fn client_executables() -> Result<String> {
+    let startup = startup_script()?;
+    let mut paths = vec![
+        install_directory()?
+            .join("dinmoo-proxy.exe")
+            .display()
+            .to_string(),
+        env::current_exe()?.display().to_string(),
+    ];
+    for script in [startup.with_extension("cmd.disabled"), startup] {
+        if let Ok(body) = std::fs::read_to_string(script) {
+            paths.extend(startup_client(&body).map(str::to_owned));
+        }
+    }
+    Ok(paths.join("\n"))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn startup_command(binary: &std::path::Path) -> String {
+    format!(
+        "@echo off\r\nfor /f \"usebackq tokens=1,* delims==\" %%A in (\"%LOCALAPPDATA%\\Programs\\DinmooProxy\\client.env\") do set \"%%A=%%B\"\r\n\"{}\" client\r\n",
+        binary.display()
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn startup_client(script: &str) -> Option<&str> {
+    script
+        .lines()
+        .find_map(|line| line.strip_prefix('"')?.strip_suffix("\" client"))
+}
+
+#[cfg(target_os = "windows")]
+fn stop_clients() -> Result<()> {
+    let status = client_processes("Get-Client | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Wait-Process -Id $_.ProcessId -Timeout 5 -ErrorAction SilentlyContinue }; if (Get-Client) { exit 1 }")?.status()?;
+    if !status.success() {
+        bail!("could not stop the client process");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn startup_script() -> Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(env::var("APPDATA")?)
+        .join(r"Microsoft\Windows\Start Menu\Programs\Startup\DinmooProxy.cmd"))
+}
+
+#[cfg(target_os = "windows")]
+fn install_directory() -> Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(env::var("LOCALAPPDATA")?).join(r"Programs\DinmooProxy"))
+}
+
 #[cfg(target_os = "macos")]
-fn mac_client_service_target() -> Result<String> {
+fn launch_agent() -> Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(env::var("HOME")?)
+        .join("Library/LaunchAgents/com.dinmoo.proxy.plist"))
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_domain() -> Result<String> {
     let uid = std::process::Command::new("id").arg("-u").output()?;
     if !uid.status.success() {
         bail!("could not determine the current user ID");
     }
-    Ok(format!(
-        "gui/{}/com.dinmoo.proxy",
-        String::from_utf8(uid.stdout)?.trim()
-    ))
+    Ok(format!("gui/{}", String::from_utf8(uid.stdout)?.trim()))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_client_service_target() -> Result<String> {
+    Ok(format!("{}/com.dinmoo.proxy", launchd_domain()?))
+}
+
+#[cfg(target_os = "linux")]
+fn user_unit() -> Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(env::var("HOME")?)
+        .join(".config/systemd/user/dinmoo-proxy.service"))
+}
+
+/// Stops Discord before the client releases its port, then relaunches Discord directly.
+pub(crate) fn disable_proxy() -> Result<()> {
+    stop_discord()?;
+    let disabled = set_client_enabled(false);
+    let launched = launch_discord_direct();
+    disabled.and(launched)
 }
 
 pub(crate) fn set_client_enabled(enabled: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let target = mac_client_service_target()?;
-        let plist = std::path::PathBuf::from(env::var("HOME")?)
-            .join("Library/LaunchAgents/com.dinmoo.proxy.plist");
+        let plist = launch_agent()?;
         if !plist.is_file() {
             bail!("client is not installed; run the terminal installer first");
         }
@@ -401,9 +492,8 @@ pub(crate) fn set_client_enabled(enabled: bool) -> Result<()> {
         }
         if enabled {
             if !client_service_running()? {
-                let domain = target.rsplit_once('/').ok_or("invalid launchd target")?.0;
                 let status = std::process::Command::new("launchctl")
-                    .args(["bootstrap", domain])
+                    .args(["bootstrap", &launchd_domain()?])
                     .arg(plist)
                     .status()?;
                 if !status.success() {
@@ -421,9 +511,7 @@ pub(crate) fn set_client_enabled(enabled: bool) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let unit = std::path::PathBuf::from(env::var("HOME")?)
-            .join(".config/systemd/user/dinmoo-proxy.service");
-        if !unit.is_file() {
+        if !user_unit()?.is_file() {
             bail!("client is not installed; run the terminal installer first");
         }
         let status = std::process::Command::new("systemctl")
@@ -441,17 +529,14 @@ pub(crate) fn set_client_enabled(enabled: bool) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let startup = std::path::PathBuf::from(env::var("APPDATA")?)
-            .join("Microsoft/Windows/Start Menu/Programs/Startup/DinmooProxy.cmd");
+        let startup = startup_script()?;
         let disabled = startup.with_extension("cmd.disabled");
         if !startup.is_file() && !disabled.is_file() {
             bail!("client is not installed; run the terminal installer first");
         }
         if enabled {
             if !client_service_running()? {
-                let config = std::path::PathBuf::from(env::var("LOCALAPPDATA")?)
-                    .join("Programs/DinmooProxy/client.env");
-                let body = std::fs::read_to_string(config)?;
+                let body = std::fs::read_to_string(install_directory()?.join("client.env"))?;
                 let token = body
                     .lines()
                     .find_map(|line| line.strip_prefix("DINMOO_PROXY_TOKEN="))
@@ -470,38 +555,37 @@ pub(crate) fn set_client_enabled(enabled: bool) -> Result<()> {
             if startup.is_file() {
                 std::fs::rename(&startup, disabled)?;
             }
-            let status = std::process::Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $env:DINMOO_CLIENT_EXE -and $_.CommandLine -match '\\sclient(\\s|$)' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }"])
-                .env("DINMOO_CLIENT_EXE", env::current_exe()?).status()?;
-            if !status.success() {
-                bail!("could not stop the client process");
-            }
+            stop_clients()?;
         }
     }
     Ok(())
 }
 
 pub(crate) fn uninstall() -> Result<()> {
-    let home = std::path::PathBuf::from(if cfg!(target_os = "windows") {
-        env::var("APPDATA")?
+    stop_discord()?;
+    let removed = remove_installation();
+    if removed.is_ok() {
+        println!("Removed the Dinmoo Proxy user service and installed binary.");
+    }
+    let launched = launch_discord_direct();
+    removed.and(launched)
+}
+
+fn remove_installation() -> Result<()> {
+    let home = std::path::PathBuf::from(env::var(if cfg!(target_os = "windows") {
+        "USERPROFILE"
     } else {
-        env::var("HOME")?
-    });
+        "HOME"
+    })?);
     #[cfg(target_os = "macos")]
     {
-        let path = home.join("Library/LaunchAgents/com.dinmoo.proxy.plist");
-        let uid = std::process::Command::new("id").arg("-u").output()?;
-        let uid = String::from_utf8(uid.stdout)?.trim().to_owned();
-        let domain = format!("gui/{uid}");
-        if path.exists() {
+        let plist = launch_agent()?;
+        if plist.exists() {
             let _ = std::process::Command::new("launchctl")
-                .args([
-                    "bootout",
-                    &domain,
-                    path.to_str().ok_or("invalid service path")?,
-                ])
+                .args(["bootout", &launchd_domain()?])
+                .arg(&plist)
                 .status();
-            std::fs::remove_file(path)?;
+            std::fs::remove_file(plist)?;
         }
     }
     #[cfg(target_os = "linux")]
@@ -509,52 +593,37 @@ pub(crate) fn uninstall() -> Result<()> {
         let _ = std::process::Command::new("systemctl")
             .args(["--user", "disable", "--now", "dinmoo-proxy.service"])
             .status();
-        let _ = std::fs::remove_file(home.join(".config/systemd/user/dinmoo-proxy.service"));
-        let _ = std::fs::remove_file(home.join(".config/dinmoo-proxy/client.env"));
+        let _ = std::fs::remove_file(user_unit()?);
         let _ = std::process::Command::new("systemctl")
             .args(["--user", "daemon-reload"])
             .status();
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::fs::remove_file(
-            home.join("Microsoft/Windows/Start Menu/Programs/Startup/DinmooProxy.cmd"),
-        );
-        let _ = std::fs::remove_file(
-            home.join("Microsoft/Windows/Start Menu/Programs/Startup/DinmooProxy.cmd.disabled"),
-        );
-        if let Ok(local) = env::var("LOCALAPPDATA") {
-            let _ = std::fs::remove_file(
-                std::path::PathBuf::from(local).join("Programs/DinmooProxy/client.env"),
-            );
-        }
-        let this_pid = std::process::id();
-        let stop_clients=format!("Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne {this_pid} -and $_.CommandLine -match 'dinmoo-proxy(\\.exe)? client' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}");
-        let _ = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &stop_clients])
-            .status();
-        if let Ok(local) = env::var("LOCALAPPDATA") {
-            let exe = std::path::PathBuf::from(local).join("Programs/DinmooProxy/dinmoo-proxy.exe");
-            if exe.exists() {
-                let cleanup=format!("Wait-Process -Id {this_pid} -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $env:DINMOO_DELETE_PATH -Force -ErrorAction SilentlyContinue");
-                std::process::Command::new("powershell.exe")
-                    .args(["-NoProfile", "-NonInteractive", "-Command", &cleanup])
-                    .env("DINMOO_DELETE_PATH", exe)
-                    .spawn()?;
-            }
+        stop_clients()?;
+        let install = install_directory()?;
+        let exe = install.join("dinmoo-proxy.exe");
+        let startup = startup_script()?;
+        let _ = std::fs::remove_file(startup.with_extension("cmd.disabled"));
+        let _ = std::fs::remove_file(startup);
+        let _ = std::fs::remove_file(install.join("client.env"));
+        if exe.exists() {
+            let cleanup = format!("Wait-Process -Id {} -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $env:DINMOO_DELETE_PATH -Force -ErrorAction SilentlyContinue", std::process::id());
+            std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &cleanup])
+                .env("DINMOO_DELETE_PATH", exe)
+                .spawn()?;
         }
     }
     #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::fs::remove_file(home.join(".local/bin/dinmoo-proxy"));
-        let _ = std::fs::remove_dir_all(home.join(".config/dinmoo-proxy"));
-    }
-    println!("Removed the Dinmoo Proxy user service and installed binary.");
-    restart_discord_direct()
+    let _ = std::fs::remove_file(home.join(".local/bin/dinmoo-proxy"));
+    // Also holds the voice identity.
+    let _ = std::fs::remove_dir_all(home.join(".config").join("dinmoo-proxy"));
+    Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stop_discord() -> Result<()> {
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn stop_discord() -> Result<()> {
     let stopped = std::process::Command::new("pkill")
         .args(["-x", "Discord"])
         .output()?;
@@ -578,6 +647,22 @@ fn stop_discord() -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     bail!("Discord did not exit within five seconds; retry the command after closing Discord")
+}
+
+/// Stops this session's Discord and waits up to five seconds for it to exit.
+#[cfg(target_os = "windows")]
+const STOP_DISCORD: &str = "$session=(Get-Process -Id $PID).SessionId; function Get-Discord { Get-Process -Name Discord -ErrorAction SilentlyContinue | Where-Object SessionId -eq $session }; Get-Discord | Stop-Process -Force -ErrorAction SilentlyContinue; for ($i=0; $i -lt 50 -and (Get-Discord); $i++) { Start-Sleep -Milliseconds 100 }; if (Get-Discord) { throw 'Discord did not exit within five seconds' }";
+
+#[cfg(target_os = "windows")]
+pub(crate) fn stop_discord() -> Result<()> {
+    let status = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!("$ErrorActionPreference='Stop'; {STOP_DISCORD}"))
+        .status()?;
+    if !status.success() {
+        bail!("could not stop Discord; retry the command after closing Discord");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -609,10 +694,10 @@ fn macos_discord_executable() -> Result<std::path::PathBuf> {
     bail!("could not locate Discord.app; install it in /Applications or ~/Applications")
 }
 
-pub(crate) fn restart_discord_direct() -> Result<()> {
+/// Launches Discord without proxy flags; call `stop_discord` first.
+pub(crate) fn launch_discord_direct() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        stop_discord()?;
         std::process::Command::new(macos_discord_executable()?)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -622,16 +707,12 @@ pub(crate) fn restart_discord_direct() -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        stop_discord()?;
         std::process::Command::new("discord")
             .spawn()
             .map_err(|_| "could not relaunch Discord")?;
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "Discord.exe", "/F"])
-            .status();
         let p = std::path::PathBuf::from(env::var("LOCALAPPDATA")?).join(r"Discord\Update.exe");
         std::process::Command::new(p)
             .args(["--processStart", "Discord.exe"])
@@ -651,19 +732,27 @@ pub(crate) fn restart_discord(proxy: &str) -> Result<()> {
     if !proxy_address.ip().is_loopback() || proxy_address.port() == 0 {
         bail!("Discord proxy must use the local loopback SOCKS5 listener");
     }
+    stop_discord()?;
     let mut discord_args = vec![
         format!("--proxy-server={proxy}"),
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned(),
     ];
-    let identity =
-        voice::identity::VoiceIdentity::load_or_create(&voice::identity::identity_directory()?)?;
+    // A fresh key per launch, so a pin learned from an earlier launch is useless.
+    let identity = match voice::identity::identity_directory()
+        .and_then(|directory| voice::identity::rotate(&directory))
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = launch_discord_direct();
+            return Err(error);
+        }
+    };
     discord_args.push(format!(
         "--ignore-certificate-errors-spki-list={}",
         identity.spki_pin
     ));
     #[cfg(target_os = "macos")]
     {
-        stop_discord()?;
         std::process::Command::new("open")
             .args(["-n", "-a"])
             .arg(macos_discord_executable()?)
@@ -677,7 +766,6 @@ pub(crate) fn restart_discord(proxy: &str) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        stop_discord()?;
         let status = std::process::Command::new("discord")
             .args(&discord_args)
             .spawn();
@@ -687,9 +775,6 @@ pub(crate) fn restart_discord(proxy: &str) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "Discord.exe", "/F"])
-            .status();
         let local = std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA is not set")?;
         let exe = std::path::PathBuf::from(local).join(r"Discord\Update.exe");
         let process_args = discord_args.join(" ");
@@ -711,4 +796,17 @@ pub(crate) fn restart_discord(proxy: &str) -> Result<()> {
         bail!("Discord launching is unsupported on this operating system");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_script_names_the_client_it_runs() {
+        let binary = r"C:\Users\Ada Lovelace\tools\dinmoo-proxy.exe";
+        let script = startup_command(std::path::Path::new(binary));
+        assert_eq!(startup_client(&script), Some(binary));
+        assert_eq!(startup_client("@echo off\r\n"), None);
+    }
 }

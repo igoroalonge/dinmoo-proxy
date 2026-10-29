@@ -822,9 +822,9 @@ fn voice_client(flavor: Flavor, prefix: &str, blast: u64, lockstep: u64) -> Vec<
             Arc::new(voice::identity::VoiceIdentity::load_or_create(&directory).unwrap());
         let mut roots = RootCertStore::empty();
         roots
-            .add(CertificateDer::from(
-                std::fs::read(directory.join("certificate.der")).unwrap(),
-            ))
+            .add(CertificateDer::from(voice::identity::certificate_der(
+                &directory,
+            )))
             .unwrap();
         let discord_tls = Arc::new(
             ClientConfig::builder()

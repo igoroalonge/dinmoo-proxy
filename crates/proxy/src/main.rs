@@ -47,7 +47,7 @@ struct Config {
     client_tls: Arc<ClientConfig>,
     server_tls: Option<TlsAcceptor>,
     media_targets: Arc<tokio::sync::RwLock<Vec<SocketAddr>>>,
-    voice_identity: Option<Arc<voice::identity::VoiceIdentity>>,
+    voice_identity: Option<Arc<voice::identity::Store>>,
     sessions: session::Registry,
 }
 
@@ -90,12 +90,12 @@ async fn main() -> Result<()> {
     }
     if first == "on" || first == "off" {
         let enabled = first == "on";
-        desktop::set_client_enabled(enabled)?;
         if enabled {
+            desktop::set_client_enabled(true)?;
             desktop::wait_for_discord_route().await?;
             desktop::restart_discord("socks5://127.0.0.1:1080")?;
         } else {
-            desktop::restart_discord_direct()?;
+            desktop::disable_proxy()?;
         }
         println!("Discord proxy is {}.", if enabled { "on" } else { "off" });
         return Ok(());
@@ -122,9 +122,7 @@ async fn main() -> Result<()> {
         let path = env::current_exe()?;
         let token = env::var("DINMOO_PROXY_TOKEN").unwrap_or_default();
         desktop::validate_install_token(&token)?;
-        desktop::install_user_service(&path, &token)?;
-        desktop::wait_for_discord_route().await?;
-        return desktop::restart_discord("socks5://127.0.0.1:1080");
+        return desktop::install_local(&path, &token).await;
     }
     if first == "check" {
         return desktop::wait_for_discord_route().await;
@@ -219,9 +217,13 @@ async fn main() -> Result<()> {
             &env::var("DINMOO_MEDIA_TARGETS").unwrap_or_default(),
         )?)),
         voice_identity: if mode == "client" {
-            Some(Arc::new(voice::identity::VoiceIdentity::load_or_create(
-                &voice::identity::identity_directory()?,
-            )?))
+            match voice::identity::identity_directory().and_then(voice::identity::Store::open) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(error) => {
+                    eprintln!("voice bridge disabled: {error}");
+                    None
+                }
+            }
         } else {
             None
         },
