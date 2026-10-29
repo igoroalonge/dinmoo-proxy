@@ -4,6 +4,7 @@
 mod unix {
     use super::super::Registry;
     use std::{
+        future::Future,
         io,
         os::unix::fs::{FileTypeExt, PermissionsExt},
         path::{Path, PathBuf},
@@ -94,25 +95,46 @@ mod unix {
         stream.shutdown().await?;
         Ok(())
     }
+    pub(super) async fn accept_loop<F, A>(mut accept: F, registry: Registry)
+    where
+        F: FnMut() -> A,
+        A: Future<Output = io::Result<UnixStream>>,
+    {
+        let capacity = Arc::new(tokio::sync::Semaphore::new(16));
+        let mut failures = 0u64;
+        loop {
+            let stream = match accept().await {
+                Ok(stream) => stream,
+                // Transient errors such as EMFILE must not disable operator access.
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    if failures == 1 || failures.is_multiple_of(1000) {
+                        eprintln!("admin socket accept failed ({failures} times): {error}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let Ok(permit) = capacity.clone().try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let _ = tokio::time::timeout(Duration::from_secs(2), serve(stream, registry)).await;
+            });
+        }
+    }
     pub fn start(registry: Registry, path: PathBuf) -> crate::Result<Handle> {
         let (listener, cleanup) = bind(&path)?;
         let task = tokio::spawn(async move {
-            let capacity = Arc::new(tokio::sync::Semaphore::new(16));
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let Ok(permit) = capacity.clone().try_acquire_owned() else {
-                    drop(stream);
-                    continue;
-                };
-                let registry = registry.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(2), serve(stream, registry)).await;
-                });
-            }
+            let listener = &listener;
+            accept_loop(
+                move || async move { Ok(listener.accept().await?.0) },
+                registry,
+            )
+            .await
         });
         Ok(Handle {
             task,
@@ -141,7 +163,7 @@ mod unix {
     }
 }
 #[cfg(all(test, unix))]
-use unix::{bind, dispatch};
+use unix::{accept_loop, bind, dispatch};
 #[cfg(unix)]
 pub use unix::{request, start};
 
@@ -178,6 +200,34 @@ mod tests {
         assert!(!second.session.cancel.is_cancelled());
         assert!(dispatch("TERMINATE not-a-session", &registry).is_err());
         assert!(dispatch("EXEC shell", &registry).is_err());
+    }
+
+    #[tokio::test]
+    async fn accept_errors_do_not_stop_the_admin_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let registry = super::super::Registry::new(std::time::Duration::from_secs(600));
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let mut accepted = vec![
+            Ok(server),
+            Err(std::io::Error::other("too many open files")),
+        ];
+        let task = tokio::spawn(accept_loop(
+            move || {
+                let next = accepted.pop();
+                async move {
+                    match next {
+                        Some(result) => result,
+                        None => std::future::pending().await,
+                    }
+                }
+            },
+            registry,
+        ));
+        client.write_all(b"LIST\n").await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert_eq!(response, "[]");
+        task.abort();
     }
 
     #[tokio::test]
