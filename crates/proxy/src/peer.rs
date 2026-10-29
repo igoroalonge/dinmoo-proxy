@@ -4,7 +4,7 @@
 //! which a same-user process able to start a bundle binary with an inherited socket gets around.
 //! The CLI uses the same lookups, reversed, to confirm that it pins Discord to this user's proxy.
 use std::net::SocketAddr;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 use std::path::{Component, Path};
 
 type Check<T = ()> = std::result::Result<T, String>;
@@ -209,7 +209,7 @@ fn discord_executable(executable: &Path, home: Option<&Path>) -> Check {
 }
 
 /// `executable` and `home` must already be canonical.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn inside_discord_bundle(executable: &Path, home: Option<&Path>) -> bool {
     let inside = |bundle: &Path| {
         bundle.is_absolute()
@@ -683,6 +683,7 @@ mod tests {
         assert!(owner_module_rows(&[1, 0], peer, listener).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn discord_bundle_policy_accepts_only_the_installed_app() {
         let home = Path::new("/Users/x");
