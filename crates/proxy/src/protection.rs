@@ -312,6 +312,24 @@ mod tests {
         assert!(limits.acquire(ip("10.0.0.4")).is_some());
     }
 
+    /// The README's figures for the deployed limits: 128 sessions, 16 per source.
+    #[tokio::test(start_paused = true)]
+    async fn deployed_limits_are_throttled_by_six_sources_and_filled_by_fourteen() {
+        let limits = Admission::new(128, 16, 120);
+        let fill = |n: u32| -> Vec<Permit> {
+            let source = std::net::Ipv4Addr::from(0x0a00_0000 + n).into();
+            std::iter::from_fn(|| limits.acquire(source))
+                .take(16)
+                .collect()
+        };
+        let held = |permits: &[Vec<Permit>]| permits.iter().map(Vec::len).collect::<Vec<_>>();
+        let mut sources: Vec<_> = (1..=6).map(fill).collect();
+        assert_eq!(held(&sources), [16; 6]);
+        sources.extend((7..=14).map(fill));
+        assert_eq!(held(&sources[6..]), [4; 8]);
+        assert!(fill(15).is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn rate_history_survives_disconnect_and_refills() {
         let limits = Admission::new(10, 10, 2);

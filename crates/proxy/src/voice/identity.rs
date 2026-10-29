@@ -1,4 +1,4 @@
-//! Client-local identity for the opt-in Discord voice TLS bridge.
+//! Client-local identity for the Discord voice TLS bridge.
 //! This certificate is never used to configure upstream trust.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rcgen::PublicKeyData;

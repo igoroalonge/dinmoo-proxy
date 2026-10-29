@@ -16,21 +16,28 @@ UDP IP and port, and a short expiration. It sends `Ready` to the local client,
 which rewrites the advertised endpoint to a per-call loopback UDP socket. UDP
 packets carry the grant ID through the TLS tunnel; neither the client nor its
 SOCKS request can select a destination. A new allocation or WSS close revokes
-the previous socket/grant.
+the previous socket/grant. A voice WebSocket that resumes (op 7, answered by
+op 9) gets no new grant, so media stops until Discord sends a fresh `Ready`;
+this is a known 0.2.6 limitation.
 
 The loopback socket drops everything until a Discord IP discovery request
 (74 bytes, type 1, carrying the `Ready` SSRC) arrives from a loopback address,
-then accepts only that sender. The pin never moves: Discord repeats discovery
-from new sockets, but SSRCs are small and sequential, so re-pinning would reopen
-the takeover. This narrows the race for the local port; it does not
+then accepts only that sender. The pin never moves. Discord appears to repeat
+discovery about every 60 seconds from new sockets; those attempts never complete
+through the bridge while the original socket keeps working, and SSRCs are small
+and sequential, so re-pinning would reopen the takeover. This narrows the race for the local port; it does not
 authenticate the sender, because any local user can see the port and guess the
 SSRC.
 
 The gateway is trusted with the call's transport. Discord's session description
 (op 4) gives it the voice `secret_key`, so it can read and forge transport-layer
 RTP/RTCP, including the audio-level and speaking extensions, and can inject
-silence. Media content is end-to-end encrypted only by Discord's DAVE protocol,
-where Discord applies it (not in stage channels). The gateway also sees call
+silence. Discord's DAVE end-to-end encryption, where Discord applies it (not in
+stage channels), keeps media content from a gateway that only relays traffic.
+DAVE's key exchange also travels over the voice WebSocket that the gateway
+relays, though, so a gateway that tampers with it could substitute its own keys
+and read or forge media. Only comparing the call's Voice Privacy Code, or a
+user's verification code, in Discord would reveal that. The gateway also sees call
 metadata, the voice session credentials and session IDs. It never receives the
 Discord account token.
 
@@ -50,12 +57,20 @@ verification, and the gateway verifies Discord's certificate on its own upstream
 WSS. The client therefore completes the local TLS handshake, which reveals the
 certificate, only for a peer the OS reports as the same user: the socket owner
 from `/proc` on Linux, the owning process from libproc on macOS (which must also
-run from Discord.app), and the owner SID on Windows, with the process bound to
-the socket's age. Other peers get a plain tunnel. The client keeps
-127.0.0.1:1080 bound for its whole lifetime, so the port Discord trusts is never
-left free for another process. Because the gateway sees the call's transport and
-metadata, the feature is opt-in at the product trust level even though the
-current client build routes voice WSS through it by default.
+run from /Applications/Discord.app or ~/Applications/Discord.app; a Discord
+installed elsewhere is launched without the pin and gets a plain tunnel, so its
+voice media is not proxied), and the owner SID on Windows, with the process
+bound to the socket's age. Other peers get a plain tunnel. `on`, `install` and
+`discord` pin Discord to 127.0.0.1:1080 only after the same lookups confirm that
+a process of the same user answers there, and otherwise relaunch Discord without
+the proxy. The client keeps that port bound for as long as it runs, while `off`,
+`uninstall` and updates close Discord before stopping it. If the client process
+dies while a proxied Discord is running, the port stays free until the service
+restarts the client (about 3 s on Linux, up to 10 s on macOS, and not until the
+next sign-in on Windows), so close Discord in that case. Because the gateway
+sees the call's transport and metadata, using a gateway means trusting its
+operator with your calls; the current client routes voice WSS through the
+bridge whenever the peer check passes and has no setting to turn it off.
 
 The local protocol tests cover certificate pin material, identity rotation, the
 peer-check fallback, local TLS/WebSocket handshake, Ready rewriting, loopback
@@ -63,6 +78,17 @@ UDP relay and discovery pinning, flow ID/source checks, expiration, and
 preservation of binary DAVE frames. Native acceptance is still needed to
 confirm that stock Discord uses this WebSocket path and that a real screen share
 plays successfully.
+
+## Gateway CONNECT gate
+
+Discord's TCP names resolve to shared Cloudflare addresses, so the gateway
+relays a CONNECT only after the client's TLS ClientHello names an allowlisted
+host. It reads only the cleartext server name. An Encrypted Client Hello's inner
+name and the HTTP `Host` header inside the TLS session are invisible to it, and
+the ECH extension cannot be refused while Chromium sends a GREASE one by
+default. If Cloudflare's edge served another site behind an outer Discord name,
+the gateway would relay to it. `scripts/probe-cloudflare-fronting.sh` checks the
+`Host` case by hand; probing ECH needs a client that sets the outer name itself.
 
 ## Diagnosis
 
