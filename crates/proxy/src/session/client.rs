@@ -3,7 +3,9 @@
 //! The local SOCKS listener is held for the life of the process: Discord trusts
 //! whatever answers on it, and a released port can be taken over by a process
 //! that bound a wildcard address in advance.
-use super::{Id, Reason, PING, PONG, TERMINATE, WRITE_TIMEOUT};
+use super::{
+    Id, Reason, CLIENT_PING_INTERVAL, CONTROL_TIMEOUT, PING, PONG, TERMINATE, WRITE_TIMEOUT,
+};
 use crate::tunnel::{self, Gateway};
 use std::{future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
@@ -33,20 +35,19 @@ async fn watch_control<S>(stream: &mut S) -> crate::Result<Reason>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut ping = tokio::time::interval(Duration::from_secs(15));
+    let mut ping = tokio::time::interval(CLIENT_PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut deadline = Instant::now() + Duration::from_secs(45);
+    let mut deadline = Instant::now() + CONTROL_TIMEOUT;
     loop {
         tokio::select! {
             _ = ping.tick() => { tokio::time::timeout(WRITE_TIMEOUT, stream.write_u8(PING)).await??; }
             _ = tokio::time::sleep_until(deadline) => return Err("gateway control heartbeat timed out".into()),
             message = stream.read_u8() => match message? {
-                PONG => { deadline = Instant::now() + Duration::from_secs(45); }
-                TERMINATE => return match tokio::time::timeout(WRITE_TIMEOUT, stream.read_u8()).await?? {
-                    1 => Ok(Reason::Idle),
-                    2 => Ok(Reason::Operator),
-                    _ => Err("unknown gateway termination reason".into()),
-                },
+                PONG => { deadline = Instant::now() + CONTROL_TIMEOUT; }
+                TERMINATE => {
+                    let reason = tokio::time::timeout(WRITE_TIMEOUT, stream.read_u8()).await??;
+                    return Ok(Reason::try_from(reason)?);
+                }
                 _ => return Err("invalid gateway control message".into()),
             }
         }
@@ -302,7 +303,7 @@ mod tests {
         let (mut client, _server) = tokio::io::duplex(64);
         let start = Instant::now();
         assert!(watch_control(&mut client).await.is_err());
-        assert!(start.elapsed() <= Duration::from_secs(45));
+        assert!(start.elapsed() <= CONTROL_TIMEOUT);
     }
 
     #[test]
