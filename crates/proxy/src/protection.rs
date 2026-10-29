@@ -6,7 +6,10 @@ use std::{
     io,
     net::{IpAddr, Ipv6Addr},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -171,11 +174,26 @@ impl Drop for Permit {
     }
 }
 
+/// Time of the last transfer, kept as milliseconds since `base` so every tunnel of a
+/// client session can record it with one relaxed store instead of a shared lock.
 #[derive(Clone)]
-pub struct Activity(Arc<Mutex<Instant>>);
+pub struct Activity {
+    base: Instant,
+    millis: Arc<AtomicU64>,
+}
 impl Activity {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            millis: Arc::new(AtomicU64::new(0)),
+        }
+    }
     pub fn last(&self) -> Instant {
-        *self.0.lock().unwrap()
+        self.base + Duration::from_millis(self.millis.load(Ordering::Relaxed))
+    }
+    fn touch(&self) {
+        let millis = self.base.elapsed().as_millis() as u64;
+        self.millis.store(millis, Ordering::Relaxed);
     }
 }
 pub struct ActivityStream<S> {
@@ -184,7 +202,7 @@ pub struct ActivityStream<S> {
 }
 impl<S> ActivityStream<S> {
     pub fn new(inner: S) -> (Self, Activity) {
-        let activity = Activity(Arc::new(Mutex::new(Instant::now())));
+        let activity = Activity::new();
         (
             Self {
                 inner,
@@ -196,9 +214,6 @@ impl<S> ActivityStream<S> {
     pub fn with_activity(inner: S, activity: Activity) -> Self {
         Self { inner, activity }
     }
-    fn touch(&self) {
-        *self.activity.0.lock().unwrap() = Instant::now();
-    }
 }
 impl<S: AsyncRead + Unpin> AsyncRead for ActivityStream<S> {
     fn poll_read(
@@ -209,7 +224,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for ActivityStream<S> {
         let before = buf.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
         if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            self.touch();
+            self.activity.touch();
         }
         result
     }
@@ -222,7 +237,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ActivityStream<S> {
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
         if matches!(result, Poll::Ready(Ok(n)) if n > 0) {
-            self.touch();
+            self.activity.touch();
         }
         result
     }
@@ -240,11 +255,11 @@ where
 {
     tokio::pin!(future);
     loop {
-        let deadline = *activity.0.lock().unwrap() + timeout;
+        let deadline = activity.last() + timeout;
         tokio::select! {
             result = &mut future => return result,
             _ = tokio::time::sleep_until(deadline) => {
-                if Instant::now().duration_since(*activity.0.lock().unwrap()) >= timeout {
+                if activity.last().elapsed() >= timeout {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "gateway session idle timeout").into());
                 }
             }
@@ -441,6 +456,25 @@ mod tests {
             }
             assert!(task.await.unwrap().is_ok());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_activity_reports_the_latest_transfer_on_any_stream() {
+        let (first, _first_peer) = tokio::io::duplex(64);
+        let (second, mut second_peer) = tokio::io::duplex(64);
+        let (mut first, activity) = ActivityStream::new(first);
+        let mut second = ActivityStream::with_activity(second, activity.clone());
+        let started = Instant::now();
+        assert_eq!(activity.last(), started);
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        first.write_u8(1).await.unwrap();
+        assert_eq!(activity.last(), started + Duration::from_millis(1500));
+        tokio::time::advance(Duration::from_millis(2250)).await;
+        second_peer.write_u8(2).await.unwrap();
+        assert_eq!(second.read_u8().await.unwrap(), 2);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        second.flush().await.unwrap();
+        assert_eq!(activity.last(), started + Duration::from_millis(3750));
     }
 
     #[tokio::test(start_paused = true)]
