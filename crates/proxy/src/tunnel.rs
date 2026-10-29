@@ -208,6 +208,11 @@ where
         reply(local, 7).await?;
         return Ok(());
     }
+    // Gateways refuse these too; answering here saves a gateway connection and rate budget.
+    if command == 1 && !allowed_tcp_destination(&host, port) {
+        reply(local, 2).await?;
+        return Ok(());
+    }
     let mut udp_source = None;
     if command == 3 {
         let Some(declared) = declared_udp_source(&host, port) else {
@@ -218,10 +223,6 @@ where
     }
     let mut identity = None;
     if let Some(store) = voice_identity.filter(|_| command == 1 && voice::allowed_host(&host)) {
-        if !allowed_tcp_destination(&host, port) {
-            reply(local, 2).await?;
-            return Ok(());
-        }
         // The local certificate is revealed only to a verified peer.
         match store.current().await {
             Ok(current) if verify_peer().await => identity = Some(current),
@@ -525,9 +526,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accept_config = server.clone();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connections = accepted.clone();
         tokio::spawn(async move {
             loop {
                 let (stream, peer) = listener.accept().await.unwrap();
+                connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let cfg = accept_config.clone();
                 tokio::spawn(async move {
                     let _ =
@@ -556,12 +560,14 @@ mod tests {
             }
         };
 
-        // A 0.2.5 gateway reads the header, session ID, greeting and request in order.
+        // A denied destination is answered without a gateway connection.
         let (mut app, tunnel) = open(id).await;
         let reply = socks(&mut app, &connect_request("evil.example", 443)).await;
         assert_eq!(reply, [5, 2, 0, 1, 0, 0, 0, 0, 0, 0]);
         tunnel.await.unwrap().unwrap();
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::Relaxed), 1);
 
+        // A 0.2.5 gateway reads the header, session ID, greeting and request in order.
         let (mut app, tunnel) = open(id).await;
         let reply = socks(&mut app, &[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await;
         assert_eq!(reply[..8], [5, 0, 0, 1, 127, 0, 0, 1]);
@@ -756,6 +762,24 @@ mod tests {
             request[1] = command;
             let (received, result) = answered_locally(&[&[5, 1, 0], &request[..]].concat()).await;
             assert_eq!(received, [5, 0, 5, 7, 0, 1, 0, 0, 0, 0, 0, 0], "{command}");
+            result.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_connect_destinations_are_refused_locally() {
+        for (host, port) in [
+            ("evil.example", 443),
+            ("discord.com", 2053),
+            ("voice.discord.media", 80),
+        ] {
+            let request = connect_request(host, port);
+            let (received, result) = answered_locally(&[&[5, 1, 0], &request[..]].concat()).await;
+            assert_eq!(
+                received,
+                [5, 0, 5, 2, 0, 1, 0, 0, 0, 0, 0, 0],
+                "{host}:{port}"
+            );
             result.unwrap();
         }
     }

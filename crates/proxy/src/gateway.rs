@@ -640,11 +640,7 @@ fn allowed_udp_destination(cfg: &Config, destination: SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        socks::read_socks_reply,
-        test_config,
-        tunnel::{proxy_socks, write_string},
-    };
+    use crate::{socks::read_socks_reply, test_config, tunnel::write_string};
     use rustls::{
         pki_types::{CertificateDer, PrivateKeyDer, ServerName},
         ClientConfig, RootCertStore, ServerConfig,
@@ -1086,31 +1082,26 @@ mod tests {
         assert_eq!(cache.0.lock().unwrap().len(), 1);
     }
 
+    /// Clients before 0.2.6 forward every destination, so the gateway must still refuse.
     #[tokio::test]
-    async fn local_client_forwards_gateway_destination_denial() {
-        let (mut application, mut client_local) = tokio::io::duplex(4096);
-        let (mut client_tunnel, mut gateway_tunnel) = tokio::io::duplex(4096);
+    async fn gateway_refuses_destinations_that_older_clients_forward() {
+        let (mut client, mut gateway_tunnel) = tokio::io::duplex(4096);
         let config = test_config();
-
-        let client_task =
-            tokio::spawn(async move { proxy_socks(&mut client_local, &mut client_tunnel).await });
         let gateway_task =
             tokio::spawn(async move { handle_socks(&mut gateway_tunnel, &config).await });
 
-        application.write_all(&[5, 1, 0]).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
         let mut method = [0; 2];
-        application.read_exact(&mut method).await.unwrap();
+        client.read_exact(&mut method).await.unwrap();
         assert_eq!(method, [5, 0]);
 
         let mut request = vec![5, 1, 0, 3, 12];
         request.extend_from_slice(b"evil.example");
         request.extend_from_slice(&443u16.to_be_bytes());
-        application.write_all(&request).await.unwrap();
-        let reply = read_socks_reply(&mut application).await.unwrap();
+        client.write_all(&request).await.unwrap();
+        let reply = read_socks_reply(&mut client).await.unwrap();
         assert_eq!(reply, [5, 2, 0, 1, 0, 0, 0, 0, 0, 0]);
-
-        client_task.await.unwrap().unwrap();
-        assert!(gateway_task.await.unwrap().is_err());
+        assert!(gateway_task.await.unwrap().unwrap_err().is::<Denied>());
     }
 
     #[tokio::test]
@@ -1215,7 +1206,6 @@ mod tests {
         config.server_tls = Some(server_tls);
         config.client_tls = client_tls.clone();
 
-        let (mut application, client_local) = tokio::io::duplex(4096);
         let (client_tunnel, gateway_tunnel) = tokio::io::duplex(64 * 1024);
         let gateway_config = config.clone();
         let gateway_task = tokio::spawn(async move {
@@ -1240,22 +1230,16 @@ mod tests {
         secure_tunnel.read_exact(&mut authenticated).await.unwrap();
         assert_eq!(authenticated, [1]);
 
-        let client_task = tokio::spawn(async move {
-            let mut local = client_local;
-            proxy_socks(&mut local, &mut secure_tunnel).await
-        });
-        application.write_all(&[5, 1, 0]).await.unwrap();
+        secure_tunnel.write_all(&[5, 1, 0]).await.unwrap();
         let mut method = [0; 2];
-        application.read_exact(&mut method).await.unwrap();
+        secure_tunnel.read_exact(&mut method).await.unwrap();
         assert_eq!(method, [5, 0]);
         let mut request = vec![5, 1, 0, 3, 12];
         request.extend_from_slice(b"evil.example");
         request.extend_from_slice(&443u16.to_be_bytes());
-        application.write_all(&request).await.unwrap();
-        let reply = read_socks_reply(&mut application).await.unwrap();
+        secure_tunnel.write_all(&request).await.unwrap();
+        let reply = read_socks_reply(&mut secure_tunnel).await.unwrap();
         assert_eq!(reply, [5, 2, 0, 1, 0, 0, 0, 0, 0, 0]);
-
-        client_task.await.unwrap().unwrap();
-        assert!(gateway_task.await.unwrap().is_err());
+        assert!(gateway_task.await.unwrap().unwrap_err().is::<Denied>());
     }
 }
