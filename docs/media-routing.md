@@ -16,9 +16,15 @@ UDP IP and port, and a short expiration. It sends `Ready` to the local client,
 which rewrites the advertised endpoint to a per-call loopback UDP socket. UDP
 packets carry the grant ID through the TLS tunnel; neither the client nor its
 SOCKS request can select a destination. A new allocation or WSS close revokes
-the previous socket/grant. A voice WebSocket that resumes (op 7, answered by
-op 9) gets no new grant, so media stops until Discord sends a fresh `Ready`;
-this is a known 0.2.6 limitation.
+the previous socket/grant, so media flows are tied to one bridge. A voice
+WebSocket that resumes (op 7, answered by op 9) gets no `Ready` and so no media
+path. When a bridge drops (network change, sleep, gateway restart, write timeout,
+Discord closing upstream), the client therefore closes Discord's voice WebSocket
+with 4006 ("Session no longer valid") rather than 1005, and closes a bridge
+the same way if Discord sends op 7 on it before any `Ready`. Discord then
+identifies again instead of resuming, so media returns after a short re-join
+(about 1-3 s) instead of about 50 s. True resume, keeping media sockets across
+bridges, is planned.
 
 The loopback socket drops everything until a Discord IP discovery request
 (74 bytes, type 1, carrying the `Ready` SSRC) arrives from a loopback address,

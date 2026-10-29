@@ -13,10 +13,30 @@ use tokio::{
 };
 use tokio_tungstenite::{
     accept_hdr_async_with_config,
-    tungstenite::{self, Message, Utf8Bytes},
+    tungstenite::{
+        self,
+        protocol::{frame::coding::CloseCode, CloseFrame},
+        Message, Utf8Bytes,
+    },
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 4006 "Session no longer valid" makes Discord identify again (new Ready); 1005 or 4009 resume.
+fn reidentify() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Library(4006),
+        reason: Utf8Bytes::from_static("voice bridge closed"),
+    }
+}
+
+/// The opcode of a voice gateway JSON message.
+fn opcode(text: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("op")?
+        .as_u64()
+}
 
 fn valid_target(path: &str, authority: &str, host: &str, port: u16) -> bool {
     if path.len() > 2048 || !(path == "/" || path.starts_with("/?")) {
@@ -166,25 +186,28 @@ where
         .take()
         .ok_or("missing voice websocket path")?;
     let mut tunnel = wire::framed(remote);
-    timeout(
-        WRITE_TIMEOUT,
-        tunnel.send(wire::record(wire::PATH, path.as_bytes())),
-    )
-    .await
-    .context("voice path write timed out")?
-    .context("write voice path")?;
     let mut flow: Option<Flow> = None;
     let mut udp = wire::UdpRecords::new(wire::UDP_SEND);
+    let (mut ready_seen, mut app_closed) = (false, false);
     let result: crate::Result<()> = async {
+        timeout(
+            WRITE_TIMEOUT,
+            tunnel.send(wire::record(wire::PATH, path.as_bytes())),
+        )
+        .await
+        .context("voice path write timed out")?
+        .context("write voice path")?;
         loop {
             tokio::select! {
                 incoming = ws.next() => {
                     match incoming {
+                        // A resume on a new bridge gets no Ready, so no media path.
+                        Some(Ok(Message::Text(text))) if !ready_seen && opcode(&text) == Some(7) => { let _ = timeout(WRITE_TIMEOUT, tunnel.send(wire::record(wire::CLOSE, &[]))).await; return Ok(()); }
                         Some(Ok(Message::Text(text))) => timeout(WRITE_TIMEOUT, tunnel.send(wire::record(wire::TEXT, text.as_bytes()))).await??,
                         Some(Ok(Message::Binary(data))) => timeout(WRITE_TIMEOUT, tunnel.send(wire::record(wire::BINARY, &data))).await??,
                         Some(Ok(Message::Ping(_))) => { timeout(WRITE_TIMEOUT, ws.flush()).await??; }
                         Some(Ok(Message::Pong(_))) => {},
-                        Some(Ok(Message::Close(_))) | None => { let _ = timeout(WRITE_TIMEOUT, tunnel.send(wire::record(wire::CLOSE, &[]))).await; return Ok(()); }
+                        Some(Ok(Message::Close(_))) | None => { app_closed = true; let _ = timeout(WRITE_TIMEOUT, tunnel.send(wire::record(wire::CLOSE, &[]))).await; return Ok(()); }
                         Some(Err(error)) => return Err(error.into()),
                         Some(Ok(Message::Frame(_))) => return Err("unexpected voice websocket frame".into()),
                     }
@@ -200,6 +223,7 @@ where
                         wire::READY => {
                             if payload.len() <= wire::FLOW_ID_LEN { return Err("invalid voice Ready record".into()); }
                             let id = payload[..wire::FLOW_ID_LEN].try_into().unwrap();
+                            ready_seen = true;
                             let socket = wire::bind_udp("127.0.0.1:0").await?;
                             let (ready, ssrc) = rewrite_ready(&payload[wire::FLOW_ID_LEN..], socket.local_addr()?.port())?;
                             flow = Some(Flow { id, socket, peer: Peer::new(ssrc) });
@@ -230,7 +254,12 @@ where
             }
         }
     }.await;
-    let _ = timeout(WRITE_TIMEOUT, ws.close(None)).await;
+    let _ = if app_closed {
+        // tungstenite has queued the reply to the app's Close; closing again would fail.
+        timeout(WRITE_TIMEOUT, ws.flush()).await
+    } else {
+        timeout(WRITE_TIMEOUT, ws.close(Some(reidentify()))).await
+    };
     result
 }
 
@@ -316,15 +345,9 @@ mod tests {
         (tag, payload.to_vec())
     }
 
-    /// Runs the bridge behind a Discord-like TLS WebSocket and delivers Ready for SSRC 42
-    /// with flow ID [5; 16]. Returns the bridge's UDP endpoint and its tunnel flush count.
-    async fn start_bridge() -> (
-        App,
-        Tunnel,
-        SocketAddr,
-        Arc<AtomicUsize>,
-        JoinHandle<crate::Result<()>>,
-    ) {
+    /// Runs the bridge behind a Discord-like TLS WebSocket, up to the path record.
+    /// Returns the bridge's tunnel flush count.
+    async fn open_bridge() -> (App, Tunnel, Arc<AtomicUsize>, JoinHandle<crate::Result<()>>) {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = rcgen::CertificateParams::new(vec!["voice.discord.media".into()])
@@ -372,11 +395,16 @@ mod tests {
             .connect(ServerName::try_from("voice.discord.media").unwrap(), client)
             .await
             .unwrap();
-        let (mut ws, _) = tokio_tungstenite::client_async("wss://voice.discord.media/?v=8", tls)
+        let (ws, _) = tokio_tungstenite::client_async("wss://voice.discord.media/?v=8", tls)
             .await
             .unwrap();
         let mut gateway = wire::framed(gateway);
         assert_eq!(next(&mut gateway).await, (wire::PATH, b"/?v=8".to_vec()));
+        (ws, gateway, flushes, task)
+    }
+
+    /// Delivers Ready for SSRC 42 with flow ID [5; 16]; returns the bridge's UDP endpoint.
+    async fn ready(ws: &mut App, gateway: &mut Tunnel) -> SocketAddr {
         let mut ready = vec![5; 16];
         ready.extend_from_slice(
             br#"{"op":2,"d":{"ip":"203.0.113.1","port":5000,"ssrc":42,"modes":["a"]}}"#,
@@ -389,10 +417,106 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&message).unwrap();
         assert_eq!(value["d"]["ip"], "127.0.0.1");
         assert_eq!(value["d"]["ssrc"], 42);
-        let endpoint = format!("127.0.0.1:{}", value["d"]["port"].as_u64().unwrap())
+        format!("127.0.0.1:{}", value["d"]["port"].as_u64().unwrap())
             .parse()
-            .unwrap();
+            .unwrap()
+    }
+
+    async fn start_bridge() -> (
+        App,
+        Tunnel,
+        SocketAddr,
+        Arc<AtomicUsize>,
+        JoinHandle<crate::Result<()>>,
+    ) {
+        let (mut ws, mut gateway, flushes, task) = open_bridge().await;
+        let endpoint = ready(&mut ws, &mut gateway).await;
         (ws, gateway, endpoint, flushes, task)
+    }
+
+    /// The close code of the app's next message, which must be a Close frame.
+    async fn close_code(ws: &mut App) -> Option<CloseCode> {
+        match timeout(Duration::from_secs(2), ws.next()).await.unwrap() {
+            Some(Ok(Message::Close(frame))) => frame.map(|frame| frame.code),
+            other => panic!("expected a Close frame, got {other:?}"),
+        }
+    }
+
+    async fn finished(task: JoinHandle<crate::Result<()>>) -> crate::Result<()> {
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn resume_on_a_new_bridge_closes_for_a_fresh_identify() {
+        let (mut ws, mut gateway, _, task) = open_bridge().await;
+        let heartbeat = r#"{"op":3,"d":{"t":1,"seq_ack":4}}"#;
+        ws.send(Message::Text(heartbeat.into())).await.unwrap();
+        assert_eq!(next(&mut gateway).await, (wire::TEXT, heartbeat.into()));
+        let resume = r#"{"op":7,"d":{"server_id":"1","session_id":"s","token":"t","seq_ack":4}}"#;
+        ws.send(Message::Text(resume.into())).await.unwrap();
+        assert_eq!(next(&mut gateway).await, (wire::CLOSE, vec![]));
+        assert_eq!(close_code(&mut ws).await, Some(CloseCode::Library(4006)));
+        assert!(finished(task).await.is_ok());
+        assert!(timeout(Duration::from_secs(2), gateway.next())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_ended_under_the_app_closes_for_a_fresh_identify() {
+        // Gateway CLOSE, tunnel EOF, and a bridge error.
+        for end in [Some(wire::CLOSE), None, Some(0)] {
+            let (mut ws, mut gateway, _, _, task) = start_bridge().await;
+            match end {
+                Some(tag) => gateway.send(wire::record(tag, &[])).await.unwrap(),
+                None => drop(gateway),
+            }
+            assert_eq!(close_code(&mut ws).await, Some(CloseCode::Library(4006)));
+            assert_eq!(finished(task).await.is_ok(), end != Some(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn only_resume_text_before_ready_is_intercepted() {
+        let (mut ws, mut gateway, _, task) = open_bridge().await;
+        let identify =
+            r#"{"op":0,"d":{"server_id":"1","user_id":"2","session_id":"s","token":"t"}}"#;
+        for text in [r#"{"op":3,"d":{"t":1}}"#, identify, "not json"] {
+            ws.send(Message::Text(text.into())).await.unwrap();
+            assert_eq!(next(&mut gateway).await, (wire::TEXT, text.into()));
+        }
+        // Binary frames are DAVE data, not JSON.
+        let resume = r#"{"op":7,"d":null}"#;
+        ws.send(Message::Binary(resume.as_bytes().to_vec().into()))
+            .await
+            .unwrap();
+        assert_eq!(next(&mut gateway).await, (wire::BINARY, resume.into()));
+        ready(&mut ws, &mut gateway).await;
+        ws.send(Message::Text(resume.into())).await.unwrap();
+        assert_eq!(next(&mut gateway).await, (wire::TEXT, resume.into()));
+        ws.close(None).await.unwrap();
+        assert_eq!(next(&mut gateway).await, (wire::CLOSE, vec![]));
+        assert!(finished(task).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn app_close_completes_its_own_handshake() {
+        let (mut ws, mut gateway, _, _, task) = start_bridge().await;
+        // Discord closes its own voice socket with 4000 before it reconnects.
+        let code = CloseCode::Library(4000);
+        ws.close(Some(CloseFrame {
+            code,
+            reason: "".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(next(&mut gateway).await, (wire::CLOSE, vec![]));
+        assert_eq!(close_code(&mut ws).await, Some(code));
+        assert!(finished(task).await.is_ok());
     }
 
     #[tokio::test]
