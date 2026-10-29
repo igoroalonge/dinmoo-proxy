@@ -1,6 +1,7 @@
 //! Ownership checks for local SOCKS peers before the voice bridge reveals its certificate.
-//! Chromium accepts the pinned voice key for any host, so only the user's own Discord
-//! (on macOS: a process inside Discord.app, which also excludes sandboxed apps) may see it.
+//! Chromium accepts the pinned voice key for any host, so only the user's own processes may
+//! see it. macOS also requires the owner to run from Discord.app; that is only a path check,
+//! which a same-user process able to start a bundle binary with an inherited socket gets around.
 use std::net::SocketAddr;
 #[cfg(any(target_os = "macos", test))]
 use std::path::{Component, Path};
@@ -56,22 +57,15 @@ fn check(peer: SocketAddr, local: SocketAddr) -> Check {
     if uid != effective_uid() {
         return Err(format!("process {pid} runs as uid {uid}"));
     }
-    let executable = macos::executable(pid)?;
-    let executable = std::fs::canonicalize(&executable)
-        .map_err(|error| format!("process {pid} at {}: {error}", executable.display()))?;
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    if !inside_discord_bundle(&executable, home.as_deref()) {
-        return Err(format!(
-            "process {pid} at {} is outside Discord.app",
-            executable.display()
-        ));
-    }
-    Ok(())
+    discord_executable(&macos::executable(pid)?, home.as_deref())
+        .map_err(|reason| format!("process {pid}: {reason}"))
 }
 
 #[cfg(windows)]
 fn check(peer: SocketAddr, local: SocketAddr) -> Check {
-    windows::same_user(windows::peer_pid(peer, local)?)
+    let (pid, created) = windows::peer_socket(peer, local)?;
+    windows::same_user(pid, created)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -122,7 +116,74 @@ fn proc_net_owners(table: &str, peer: SocketAddr, local: SocketAddr) -> Check<Ve
     Ok(owners)
 }
 
-/// `executable` must already be canonical.
+/// Byte layout of MIB_TCPTABLE_OWNER_MODULE, asserted against windows-sys on Windows: a u32 row
+/// count, then 8-byte aligned rows.
+#[cfg(any(windows, test))]
+mod owner_module {
+    pub(super) const TABLE: usize = 8;
+    pub(super) const ROW: usize = 160;
+    pub(super) const LOCAL_ADDR: usize = 4;
+    pub(super) const LOCAL_PORT: usize = 8;
+    pub(super) const REMOTE_ADDR: usize = 12;
+    pub(super) const REMOTE_PORT: usize = 16;
+    pub(super) const OWNING_PID: usize = 20;
+    pub(super) const CREATE_TIMESTAMP: usize = 24;
+}
+
+/// (owning pid, socket creation FILETIME) of rows whose local end is `peer` and remote end `local`.
+#[cfg(any(windows, test))]
+fn owner_module_rows(
+    table: &[u8],
+    peer: std::net::SocketAddrV4,
+    local: std::net::SocketAddrV4,
+) -> Check<Vec<(u32, i64)>> {
+    use owner_module::*;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    fn at<const N: usize>(bytes: &[u8], offset: usize) -> [u8; N] {
+        let mut value = [0; N];
+        value.copy_from_slice(&bytes[offset..offset + N]);
+        value
+    }
+    let count = table.get(..4).ok_or("empty TCP table")?;
+    let count = u32::from_ne_bytes(at(count, 0)) as usize;
+    let rows = count
+        .checked_mul(ROW)
+        .and_then(|len| table.get(TABLE..)?.get(..len))
+        .ok_or("truncated TCP table")?;
+    // Addresses are raw in_addr values; a port's first two bytes hold it in network order.
+    let endpoint = |row: &[u8], addr, port| {
+        SocketAddrV4::new(
+            Ipv4Addr::from(at::<4>(row, addr)),
+            u16::from_be_bytes(at(row, port)),
+        )
+    };
+    Ok(rows
+        .chunks_exact(ROW)
+        .filter(|row| {
+            endpoint(row, LOCAL_ADDR, LOCAL_PORT) == peer
+                && endpoint(row, REMOTE_ADDR, REMOTE_PORT) == local
+        })
+        .map(|row| {
+            (
+                u32::from_ne_bytes(at(row, OWNING_PID)),
+                i64::from_ne_bytes(at(row, CREATE_TIMESTAMP)),
+            )
+        })
+        .collect())
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn discord_executable(executable: &Path, home: Option<&Path>) -> Check {
+    let canonical = std::fs::canonicalize(executable)
+        .map_err(|error| format!("{}: {error}", executable.display()))?;
+    let home = home.and_then(|home| std::fs::canonicalize(home).ok());
+    if !inside_discord_bundle(&canonical, home.as_deref()) {
+        return Err(format!("{} is outside Discord.app", canonical.display()));
+    }
+    Ok(())
+}
+
+/// `executable` and `home` must already be canonical.
 #[cfg(any(target_os = "macos", test))]
 fn inside_discord_bundle(executable: &Path, home: Option<&Path>) -> bool {
     let inside = |bundle: &Path| {
@@ -336,31 +397,33 @@ mod macos {
 
 #[cfg(windows)]
 mod windows {
-    use super::{canonical, single, Check};
-    use std::{
-        io,
-        mem::offset_of,
-        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    };
+    use super::{canonical, owner_module, owner_module_rows, single, Check};
+    use std::{io, mem::offset_of, net::SocketAddr};
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, NO_ERROR},
+        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, NO_ERROR},
         NetworkManagement::IpHelper::{
-            GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+            GetExtendedTcpTable, MIB_TCPROW_OWNER_MODULE, MIB_TCPTABLE_OWNER_MODULE,
+            TCP_TABLE_OWNER_MODULE_ALL,
         },
         Networking::WinSock::AF_INET,
         Security::{EqualSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER},
         System::Threading::{
-            GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+            GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
+            PROCESS_QUERY_LIMITED_INFORMATION,
         },
     };
 
-    // MIB_TCPTABLE_OWNER_PID is a u32 row count followed by rows of u32 fields.
-    const ROW: usize = size_of::<MIB_TCPROW_OWNER_PID>() / 4;
-    const LOCAL_ADDR: usize = offset_of!(MIB_TCPROW_OWNER_PID, dwLocalAddr) / 4;
-    const LOCAL_PORT: usize = offset_of!(MIB_TCPROW_OWNER_PID, dwLocalPort) / 4;
-    const REMOTE_ADDR: usize = offset_of!(MIB_TCPROW_OWNER_PID, dwRemoteAddr) / 4;
-    const REMOTE_PORT: usize = offset_of!(MIB_TCPROW_OWNER_PID, dwRemotePort) / 4;
-    const OWNING_PID: usize = offset_of!(MIB_TCPROW_OWNER_PID, dwOwningPid) / 4;
+    type Row = MIB_TCPROW_OWNER_MODULE;
+    const _: () = assert!(
+        offset_of!(MIB_TCPTABLE_OWNER_MODULE, table) == owner_module::TABLE
+            && size_of::<Row>() == owner_module::ROW
+            && offset_of!(Row, dwLocalAddr) == owner_module::LOCAL_ADDR
+            && offset_of!(Row, dwLocalPort) == owner_module::LOCAL_PORT
+            && offset_of!(Row, dwRemoteAddr) == owner_module::REMOTE_ADDR
+            && offset_of!(Row, dwRemotePort) == owner_module::REMOTE_PORT
+            && offset_of!(Row, dwOwningPid) == owner_module::OWNING_PID
+            && offset_of!(Row, liCreateTimestamp) == owner_module::CREATE_TIMESTAMP
+    );
 
     struct Handle(HANDLE);
 
@@ -371,37 +434,18 @@ mod windows {
         }
     }
 
-    pub(super) fn peer_pid(peer: SocketAddr, local: SocketAddr) -> Check<u32> {
+    /// Pid of the process that created the peer's socket, and the socket's creation FILETIME.
+    pub(super) fn peer_socket(peer: SocketAddr, local: SocketAddr) -> Check<(u32, i64)> {
         let (SocketAddr::V4(peer), SocketAddr::V4(local)) = (canonical(peer), canonical(local))
         else {
             return Err("IPv6 peers are not checked".into());
         };
-        let table = tcp_table()?;
-        let count = *table.first().ok_or("empty TCP table")? as usize;
-        let rows = count
-            .checked_mul(ROW)
-            .and_then(|words| table.get(1..)?.get(..words))
-            .ok_or("truncated TCP table")?;
-        // Addresses are raw in_addr values; ports are network-order u16 in the low bits.
-        let endpoint = |addr: u32, port: u32| {
-            SocketAddrV4::new(
-                Ipv4Addr::from(addr.to_ne_bytes()),
-                u16::from_be(port as u16),
-            )
-        };
-        let owners: Vec<u32> = rows
-            .chunks_exact(ROW)
-            .filter(|row| {
-                endpoint(row[LOCAL_ADDR], row[LOCAL_PORT]) == peer
-                    && endpoint(row[REMOTE_ADDR], row[REMOTE_PORT]) == local
-            })
-            .map(|row| row[OWNING_PID])
-            .collect();
-        single(&owners)
+        single(&owner_module_rows(&tcp_table()?, peer, local)?)
     }
 
-    fn tcp_table() -> Check<Vec<u32>> {
-        let mut table: Vec<u32> = Vec::new();
+    fn tcp_table() -> Check<Vec<u8>> {
+        // u64 words keep the rows' 64-bit fields aligned.
+        let mut table: Vec<u64> = Vec::new();
         let mut size = 0u32;
         for _ in 0..4 {
             let buffer = if table.is_empty() {
@@ -416,15 +460,17 @@ mod windows {
                     &mut size,
                     0,
                     AF_INET as u32,
-                    TCP_TABLE_OWNER_PID_ALL,
+                    TCP_TABLE_OWNER_MODULE_ALL,
                     0,
                 )
             };
             match status {
-                NO_ERROR if !table.is_empty() => return Ok(table),
+                NO_ERROR if !table.is_empty() => {
+                    return Ok(table.iter().flat_map(|word| word.to_ne_bytes()).collect())
+                }
                 NO_ERROR | ERROR_INSUFFICIENT_BUFFER => {
-                    table = vec![0; (size as usize).div_ceil(4) + 16 * ROW];
-                    size = (table.len() * 4) as u32;
+                    table = vec![0; (size as usize + 16 * owner_module::ROW).div_ceil(8)];
+                    size = (table.len() * 8) as u32;
                 }
                 status => return Err(format!("GetExtendedTcpTable failed with {status}")),
             }
@@ -464,7 +510,19 @@ mod windows {
         Ok(user)
     }
 
-    pub(super) fn same_user(pid: u32) -> Check {
+    fn creation_time(process: HANDLE) -> Check<i64> {
+        let mut times = [FILETIME::default(); 4];
+        let [created, exited, kernel, user] = &mut times;
+        // SAFETY: all four out pointers are valid FILETIMEs.
+        if unsafe { GetProcessTimes(process, created, exited, kernel, user) } == 0 {
+            return Err(format!("process times: {}", io::Error::last_os_error()));
+        }
+        Ok((i64::from(created.dwHighDateTime) << 32) | i64::from(created.dwLowDateTime))
+    }
+
+    /// The table's pid is the socket's creator, which may have exited while a process it handed
+    /// the socket to stays connected; a process started after the socket only reuses that pid.
+    pub(super) fn same_user(pid: u32, socket_created: i64) -> Check {
         // SAFETY: returns a pseudo-handle that needs no closing.
         let ours = token_user(unsafe { GetCurrentProcess() })?;
         // SAFETY: plain call; failure returns null.
@@ -473,6 +531,13 @@ mod windows {
             return Err(format!("process {pid}: {}", io::Error::last_os_error()));
         }
         let process = Handle(process);
+        // The open handle keeps the pid from being reused until the checks are done.
+        let started = creation_time(process.0)?;
+        if socket_created <= 0 || started > socket_created {
+            return Err(format!(
+                "process {pid} started after the socket was created"
+            ));
+        }
         let theirs = token_user(process.0)?;
         // SAFETY: both buffers start with a TOKEN_USER written by GetTokenInformation whose
         // SID points into the same buffer, and both buffers outlive the comparison.
@@ -547,6 +612,52 @@ mod tests {
         }
     }
 
+    /// A MIB_TCPTABLE_OWNER_MODULE laid out by hand, independently of `owner_module`.
+    fn owner_module_table(count: u32, rows: &[(&str, &str, u32, i64)]) -> Vec<u8> {
+        let mut table = vec![0; 8 + rows.len() * 160];
+        table[..4].copy_from_slice(&count.to_ne_bytes());
+        for (row, (source, destination, pid, created)) in table[8..].chunks_mut(160).zip(rows) {
+            row[..4].copy_from_slice(&5u32.to_ne_bytes());
+            for (at, end) in [(4, source), (12, destination)] {
+                let end: std::net::SocketAddrV4 = end.parse().unwrap();
+                row[at..at + 4].copy_from_slice(&end.ip().octets());
+                let [high, low] = end.port().to_be_bytes();
+                row[at + 4..at + 8].copy_from_slice(&[high, low, 0xAB, 0xCD]);
+            }
+            row[20..24].copy_from_slice(&pid.to_ne_bytes());
+            row[24..32].copy_from_slice(&created.to_ne_bytes());
+            row[32..].fill(0xEE);
+        }
+        table
+    }
+
+    #[test]
+    fn owner_module_rows_match_only_the_peer_end_with_its_creation_time() {
+        let v4 = |value: &str| value.parse::<std::net::SocketAddrV4>().unwrap();
+        let (peer, listener) = (v4("127.0.0.1:53922"), v4("127.0.0.1:1080"));
+        let rows = [
+            ("127.0.0.1:1080", "127.0.0.1:53922", 4, 100),
+            ("127.0.0.1:53922", "127.0.0.1:1080", 7, 200),
+            ("127.0.0.1:53923", "127.0.0.1:1080", 8, 300),
+        ];
+        let mut table = owner_module_table(3, &rows);
+        table.extend([0; 40]);
+        assert_eq!(
+            owner_module_rows(&table, peer, listener),
+            Ok(vec![(7, 200)])
+        );
+        assert_eq!(
+            owner_module_rows(&table, listener, peer),
+            Ok(vec![(4, 100)])
+        );
+        assert_eq!(
+            owner_module_rows(&table, v4("127.0.0.1:53924"), listener),
+            Ok(vec![])
+        );
+        assert!(owner_module_rows(&owner_module_table(4, &rows), peer, listener).is_err());
+        assert!(owner_module_rows(&[1, 0], peer, listener).is_err());
+    }
+
     #[test]
     fn discord_bundle_policy_accepts_only_the_installed_app() {
         let home = Path::new("/Users/x");
@@ -580,6 +691,33 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn discord_executable_is_judged_by_canonical_paths() {
+        let root = std::env::temp_dir().join(format!("dinmoo-peer-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bundle = root.join("real/Applications/Discord.app/Contents/MacOS");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("Discord"), b"").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("home")).unwrap();
+        let home = root.join("home");
+        let installed = home.join("Applications/Discord.app/Contents/MacOS/Discord");
+        let results = [
+            discord_executable(&installed, Some(&home)),
+            discord_executable(&bundle.join("Discord"), Some(&home)),
+            discord_executable(&installed, None),
+            discord_executable(&home.join("missing"), Some(&home)),
+        ];
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(results[0], Ok(()));
+        assert_eq!(results[1], Ok(()));
+        assert!(results[2]
+            .as_ref()
+            .unwrap_err()
+            .contains("outside Discord.app"));
+        assert!(results[3].is_err());
+    }
+
     fn loopback_connection() -> (TcpListener, TcpStream, TcpStream, SocketAddr, SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -611,6 +749,13 @@ mod tests {
         let pid = macos::peer_pid(peer, local).unwrap();
         assert_eq!(pid, std::process::id() as libc::pid_t);
         assert_eq!(macos::process_uid(pid), Ok(effective_uid()));
+        assert_eq!(
+            std::fs::canonicalize(macos::executable(pid).unwrap()).unwrap(),
+            std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+        );
+        assert!(check(peer, local)
+            .unwrap_err()
+            .contains("outside Discord.app"));
         assert!(macos::peer_pid(unused_port(), local).is_err());
         assert!(macos::peer_pid(local, unused_port()).is_err());
     }
@@ -619,11 +764,13 @@ mod tests {
     #[test]
     fn windows_lookup_finds_this_process_for_an_accepted_loopback_connection() {
         let (_listener, _client, _server, peer, local) = loopback_connection();
-        let pid = windows::peer_pid(peer, local).unwrap();
+        let (pid, created) = windows::peer_socket(peer, local).unwrap();
         assert_eq!(pid, std::process::id());
-        assert_eq!(windows::same_user(pid), Ok(()));
-        assert!(windows::peer_pid(unused_port(), local).is_err());
-        assert!(windows::peer_pid(local, unused_port()).is_err());
+        assert_eq!(windows::same_user(pid, created), Ok(()));
+        assert!(windows::same_user(pid, 0).is_err());
+        assert!(windows::same_user(pid, 1).is_err());
+        assert!(windows::peer_socket(unused_port(), local).is_err());
+        assert!(windows::peer_socket(local, unused_port()).is_err());
     }
 
     #[tokio::test]
