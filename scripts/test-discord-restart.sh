@@ -8,13 +8,17 @@ export DINMOO_RESTART_TEST_DIR="$test_dir"
 unset DINMOO_VOICE_IDENTITY_DIR
 mkdir "$test_dir/bin"
 mkdir -p "$test_dir/home/Applications/Discord.app/Contents/MacOS"
+# Another user's Discord can be neither signalled nor waited for, so both tools
+# must match only this user's processes.
 cat >"$test_dir/bin/pkill" <<'SH'
 #!/bin/sh
+[ "$*" = "-U $(id -u) -x Discord" ] || { echo "unexpected pkill arguments: $*" >&2; exit 2; }
 printf 'stop\n' >>"$DINMOO_RESTART_TEST_DIR/events"
 printf '0\n' >"$DINMOO_RESTART_TEST_DIR/count"
 SH
 cat >"$test_dir/bin/pgrep" <<'SH'
 #!/bin/sh
+[ "$*" = "-U $(id -u) -x Discord" ] || { echo "unexpected pgrep arguments: $*" >&2; exit 2; }
 if [ "${DINMOO_RESTART_TEST_ERROR:-}" = yes ]; then exit 2; fi
 count=$(cat "$DINMOO_RESTART_TEST_DIR/count")
 count=$((count + 1))
@@ -94,6 +98,7 @@ rm "$test_dir/launch"
 cat >"$test_dir/bin/launchctl" <<'SH'
 #!/bin/sh
 printf 'launchctl %s\n' "$1" >>"$DINMOO_RESTART_TEST_DIR/events"
+[ "$1" != "${DINMOO_RESTART_TEST_LAUNCHCTL_FAIL:-}" ] || exit 5
 SH
 chmod 755 "$test_dir/bin/launchctl"
 plist="$HOME/Library/LaunchAgents/com.dinmoo.proxy.plist"
@@ -115,10 +120,18 @@ if grep -q -- '--ignore-certificate-errors-spki-list=' "$test_dir/launch"; then
     fail 'off relaunched Discord with the voice pin'
 fi
 rm "$test_dir/launch" "$test_dir/events"
+# A client that cannot be stopped must not be reported as removed.
+if DINMOO_RESTART_TEST_LAUNCHCTL_FAIL=bootout "$binary" uninstall >"$test_dir/output" 2>&1; then
+    fail 'uninstall ignored a failed launchctl bootout'
+fi
+wait_for_launch
+! grep -q 'Removed' "$test_dir/output" || fail 'uninstall reported removal while the client kept running'
+[ -e "$plist" ] || fail 'uninstall removed the launch agent of a client it could not stop'
+rm "$test_dir/launch" "$test_dir/events"
 "$binary" uninstall >/dev/null
 wait_for_launch
 assert_before stop 'launchctl bootout'
 assert_before 'launchctl bootout' launch
 [ ! -e "$plist" ] || fail 'uninstall left the launch agent'
 echo 'PASS: Discord exit is awaited before launch; each launch rotates the pin; process errors prevent relaunch; a failed rotation relaunches Discord directly'
-echo 'PASS: off and uninstall stop Discord before the client and relaunch it directly'
+echo 'PASS: off and uninstall stop Discord before the client and relaunch it directly; a client that cannot be stopped is not reported removed'

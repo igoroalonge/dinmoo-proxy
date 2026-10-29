@@ -257,9 +257,7 @@ pub(crate) fn install_user_service(binary: &std::path::Path, token: &str) -> Res
         std::fs::write(&plist, body)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o600))?;
-        let uid = std::process::Command::new("id").arg("-u").output()?;
-        let uid = String::from_utf8(uid.stdout)?.trim().to_owned();
-        let domain = format!("gui/{uid}");
+        let domain = launchd_domain()?;
         let enabled = std::process::Command::new("launchctl")
             .args(["enable", &format!("{domain}/com.dinmoo.proxy")])
             .status()?;
@@ -341,18 +339,19 @@ pub(crate) fn install_user_service(binary: &std::path::Path, token: &str) -> Res
             let _ = std::fs::remove_file(envfile);
             bail!("could not restrict access to the Windows client credential file");
         }
+        // Restart like launchd and systemd do. Stop first: the old script still names a
+        // client started from an earlier install location.
+        stop_clients()?;
         std::fs::write(&cmd, startup_command(binary))?;
         if cmd.with_extension("cmd.disabled").exists() {
             std::fs::remove_file(cmd.with_extension("cmd.disabled"))?;
         }
-        if !client_service_running()? {
-            use std::os::windows::process::CommandExt;
-            std::process::Command::new(binary)
-                .arg("client")
-                .env("DINMOO_PROXY_TOKEN", token)
-                .creation_flags(0x08000000)
-                .spawn()?;
-        }
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new(binary)
+            .arg("client")
+            .env("DINMOO_PROXY_TOKEN", token)
+            .creation_flags(0x08000000)
+            .spawn()?;
     }
     Ok(())
 }
@@ -462,6 +461,20 @@ fn mac_client_service_target() -> Result<String> {
     Ok(format!("{}/com.dinmoo.proxy", launchd_domain()?))
 }
 
+/// Unloads the client service if launchd has it loaded.
+#[cfg(target_os = "macos")]
+fn bootout_client() -> Result<()> {
+    if client_service_running()? {
+        let status = std::process::Command::new("launchctl")
+            .args(["bootout", &mac_client_service_target()?])
+            .status()?;
+        if !status.success() {
+            bail!("could not stop the client service");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn user_unit() -> Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(env::var("HOME")?)
@@ -490,22 +503,15 @@ pub(crate) fn set_client_enabled(enabled: bool) -> Result<()> {
         if !status.success() {
             bail!("could not change client startup state");
         }
-        if enabled {
-            if !client_service_running()? {
-                let status = std::process::Command::new("launchctl")
-                    .args(["bootstrap", &launchd_domain()?])
-                    .arg(plist)
-                    .status()?;
-                if !status.success() {
-                    bail!("could not start the client service");
-                }
-            }
-        } else if client_service_running()? {
+        if !enabled {
+            bootout_client()?;
+        } else if !client_service_running()? {
             let status = std::process::Command::new("launchctl")
-                .args(["bootout", &target])
+                .args(["bootstrap", &launchd_domain()?])
+                .arg(plist)
                 .status()?;
             if !status.success() {
-                bail!("could not stop the client service");
+                bail!("could not start the client service");
             }
         }
     }
@@ -581,19 +587,22 @@ fn remove_installation() -> Result<()> {
     {
         let plist = launch_agent()?;
         if plist.exists() {
-            let _ = std::process::Command::new("launchctl")
-                .args(["bootout", &launchd_domain()?])
-                .arg(&plist)
-                .status();
+            bootout_client()?;
             std::fs::remove_file(plist)?;
         }
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "disable", "--now", "dinmoo-proxy.service"])
-            .status();
-        let _ = std::fs::remove_file(user_unit()?);
+        let unit = user_unit()?;
+        if unit.is_file() {
+            let status = std::process::Command::new("systemctl")
+                .args(["--user", "disable", "--now", "dinmoo-proxy.service"])
+                .status()?;
+            if !status.success() {
+                bail!("could not stop the client service");
+            }
+        }
+        let _ = std::fs::remove_file(unit);
         let _ = std::process::Command::new("systemctl")
             .args(["--user", "daemon-reload"])
             .status();
@@ -624,9 +633,11 @@ fn remove_installation() -> Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn stop_discord() -> Result<()> {
-    let stopped = std::process::Command::new("pkill")
-        .args(["-x", "Discord"])
-        .output()?;
+    // Another user's Discord can be neither signalled nor waited for.
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() }.to_string();
+    let ours = ["-U", &uid, "-x", "Discord"];
+    let stopped = std::process::Command::new("pkill").args(ours).output()?;
     if !stopped.status.success() && stopped.status.code() != Some(1) {
         bail!(
             "could not stop Discord: {}",
@@ -635,7 +646,7 @@ pub(crate) fn stop_discord() -> Result<()> {
     }
     for _ in 0..50 {
         let status = std::process::Command::new("pgrep")
-            .args(["-x", "Discord"])
+            .args(ours)
             .output()?
             .status;
         if status.code() == Some(1) {
