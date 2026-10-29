@@ -5,8 +5,17 @@ trait ContextExt<T> {
     fn context(self, message: &'static str) -> Result<T>;
 }
 impl<T, E: Error + Send + Sync + 'static> ContextExt<T> for std::result::Result<T, E> {
+    // Keeps the error kind so callers can still tell disconnects and timeouts apart.
     fn context(self, message: &'static str) -> Result<T> {
-        self.map_err(|e| io::Error::other(format!("{message}: {e}")).into())
+        self.map_err(|e| {
+            let source: &(dyn Error + 'static) = &e;
+            let kind = match source.downcast_ref::<io::Error>() {
+                Some(error) => error.kind(),
+                None if source.is::<tokio::time::error::Elapsed>() => io::ErrorKind::TimedOut,
+                None => io::ErrorKind::Other,
+            };
+            io::Error::new(kind, format!("{message}: {e}")).into()
+        })
     }
 }
 use rustls::{

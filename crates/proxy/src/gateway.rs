@@ -8,18 +8,38 @@ use crate::{
     voice, Config, ContextExt, Result, AUTH_HANDSHAKE_TIMEOUT, DESTINATION_CONNECT_TIMEOUT,
     SOCKS_HANDSHAKE_TIMEOUT, TCP_COPY_BUFFER_SIZE, TLS_HANDSHAKE_TIMEOUT,
 };
+use rustls::server::Acceptor;
 use std::{
     collections::{HashMap, VecDeque},
-    env, io,
+    env,
+    error::Error,
+    fmt,
+    future::Future,
+    io,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
+    time::Instant,
 };
+
+/// Logs a policy denial through `DENIALS` and returns it as a `Denied` error.
+macro_rules! deny {
+    ($($arg:tt)*) => { return Err(denied(format_args!($($arg)*))) };
+}
+
+/// One maximum-size handshake record plus a few record headers of fragmentation.
+const CLIENT_HELLO_LIMIT: usize = 16 * 1024 + 4 * 5;
+const ACCEPT_BACKOFF: (Duration, Duration) = (Duration::from_millis(100), Duration::from_secs(1));
+const LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+static ACCEPT_ERRORS: LogLimiter = LogLimiter::new();
+static DENIALS: LogLimiter = LogLimiter::new();
+static SESSION_ERRORS: LogLimiter = LogLimiter::new();
 
 pub(crate) async fn serve(
     config: Arc<Config>,
@@ -39,7 +59,7 @@ pub(crate) async fn serve(
     );
     let mut rejected_sessions = 0u64;
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = next_connection(|| listener.accept()).await;
         let Some(permit) = admission.acquire(peer.ip()) else {
             rejected_sessions = rejected_sessions.saturating_add(1);
             if rejected_sessions == 1 || rejected_sessions.is_multiple_of(1000) {
@@ -58,10 +78,110 @@ pub(crate) async fn serve(
                 handle_gateway_connection(stream, &cfg, peer.ip()).await
             }
             .await;
-            if let Err(e) = result {
-                eprintln!("session: {e:#}");
+            if let Err(error) = result {
+                if !benign(&*error) && !error.is::<Denied>() {
+                    SESSION_ERRORS.log(format_args!("session: {error:#}"));
+                }
             }
         });
+    }
+}
+
+/// Accept errors never stop the gateway. Errors other than a failed pending connection
+/// usually mean descriptor or memory exhaustion, so back off while sessions drain.
+async fn next_connection<T, F, A>(mut accept: F) -> T
+where
+    F: FnMut() -> A,
+    A: Future<Output = io::Result<T>>,
+{
+    use io::ErrorKind::*;
+    let mut delay = None;
+    loop {
+        let error = match accept().await {
+            Ok(connection) => return connection,
+            Err(error) => error,
+        };
+        ACCEPT_ERRORS.log(format_args!("gateway accept: {error}"));
+        if !matches!(
+            error.kind(),
+            ConnectionAborted
+                | ConnectionReset
+                | Interrupted
+                | WouldBlock
+                | PermissionDenied
+                | HostUnreachable
+                | NetworkUnreachable
+                | NetworkDown
+        ) {
+            let next = delay.map_or(ACCEPT_BACKOFF.0, |delay: Duration| {
+                (delay * 2).min(ACCEPT_BACKOFF.1)
+            });
+            delay = Some(next);
+            tokio::time::sleep(next).await;
+        }
+    }
+}
+
+/// Connections routinely end without close_notify, by reset or by timeout; logging each
+/// one costs more CPU than a resumed handshake and floods the journal.
+fn benign(error: &(dyn Error + 'static)) -> bool {
+    use io::ErrorKind::*;
+    error.is::<tokio::time::error::Elapsed>()
+        || error.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                UnexpectedEof
+                    | ConnectionReset
+                    | ConnectionAborted
+                    | BrokenPipe
+                    | NotConnected
+                    | TimedOut
+            )
+        })
+}
+
+/// A policy denial, already logged through `DENIALS`.
+#[derive(Debug)]
+struct Denied(String);
+impl fmt::Display for Denied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl Error for Denied {}
+
+fn denied(reason: fmt::Arguments) -> Box<dyn Error + Send + Sync> {
+    let reason = reason.to_string();
+    DENIALS.log(format_args!("{reason}"));
+    Box::new(Denied(reason))
+}
+
+/// At most one line per interval for per-connection events, counting the rest.
+struct LogLimiter(Mutex<(Option<Instant>, u64)>);
+impl LogLimiter {
+    const fn new() -> Self {
+        Self(Mutex::new((None, 0)))
+    }
+    /// Returns how many events were suppressed since the last allowed one.
+    fn check(&self) -> Option<u64> {
+        let now = Instant::now();
+        let mut state = self.0.lock().unwrap();
+        if state
+            .0
+            .is_some_and(|last| now.duration_since(last) < LOG_INTERVAL)
+        {
+            state.1 += 1;
+            return None;
+        }
+        state.0 = Some(now);
+        Some(std::mem::take(&mut state.1))
+    }
+    fn log(&self, message: fmt::Arguments) {
+        match self.check() {
+            Some(0) => eprintln!("{message}"),
+            Some(suppressed) => eprintln!("{message} (+{suppressed} similar suppressed)"),
+            None => {}
+        }
     }
 }
 
@@ -191,9 +311,8 @@ async fn handle_socks<S: AsyncRead + AsyncWrite + Unpin>(
     }
     if command == 1 {
         if !allowed_tcp_destination(&host, port) {
-            eprintln!("SOCKS TCP destination denied: {host:?}:{port}");
             reply(stream, 2).await?;
-            bail!("destination denied by policy");
+            deny!("SOCKS TCP destination denied: {host:?}:{port}");
         }
         let dest = format!("{host}:{port}");
         let mut target = None;
@@ -213,20 +332,12 @@ async fn handle_socks<S: AsyncRead + AsyncWrite + Unpin>(
                 break;
             }
         }
-        if let Some(mut target) = target {
-            reply(stream, 0).await?;
-            tokio::io::copy_bidirectional_with_sizes(
-                stream,
-                &mut target,
-                TCP_COPY_BUFFER_SIZE,
-                TCP_COPY_BUFFER_SIZE,
-            )
-            .await?;
-        } else {
+        let Some(mut target) = target else {
             reply(stream, 5).await?;
             bail!("Discord destination did not resolve to a reachable public address");
-        }
-        return Ok(());
+        };
+        reply(stream, 0).await?;
+        return relay_tls(stream, &mut target, port).await;
     }
     if command == 3 {
         let socket_v4 = UdpSocket::bind("0.0.0.0:0").await?;
@@ -237,6 +348,68 @@ async fn handle_socks<S: AsyncRead + AsyncWrite + Unpin>(
     }
     reply(stream, 7).await?;
     bail!("unsupported SOCKS command");
+}
+
+/// Relays a client TLS connection once its ClientHello names an allowed host. The SOCKS
+/// reply comes first, so a route check that never speaks TLS still sees success.
+async fn relay_tls<C, T>(client: &mut C, target: &mut T, port: u16) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let hello = tokio::time::timeout(SOCKS_HANDSHAKE_TIMEOUT, read_client_hello(client, port))
+        .await
+        .context("TLS ClientHello timed out")??;
+    target.write_all(&hello).await?;
+    drop(hello);
+    tokio::io::copy_bidirectional_with_sizes(
+        client,
+        target,
+        TCP_COPY_BUFFER_SIZE,
+        TCP_COPY_BUFFER_SIZE,
+    )
+    .await?;
+    Ok(())
+}
+
+// Discord names resolve to shared Cloudflare anycast addresses that route by SNI, so the
+// approved SOCKS host name alone would let anyone reach any Cloudflare-hosted site.
+async fn read_client_hello<S: AsyncRead + Unpin>(stream: &mut S, port: u16) -> Result<Vec<u8>> {
+    let mut hello = Vec::new();
+    let mut chunk = [0; 4096];
+    let mut acceptor = Acceptor::default();
+    loop {
+        let room = CLIENT_HELLO_LIMIT - hello.len();
+        if room == 0 {
+            deny!("SOCKS TLS ClientHello too large (port {port})");
+        }
+        let limit = room.min(chunk.len());
+        let read = stream.read(&mut chunk[..limit]).await?;
+        if read == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+        }
+        if hello.is_empty() && chunk[0] != 0x16 {
+            deny!("SOCKS TCP stream is not TLS (port {port})");
+        }
+        hello.extend_from_slice(&chunk[..read]);
+        let mut fresh = &chunk[..read];
+        while !fresh.is_empty() {
+            if !matches!(acceptor.read_tls(&mut fresh), Ok(1..)) {
+                deny!("invalid SOCKS TLS record (port {port})");
+            }
+        }
+        let accepted = match acceptor.accept() {
+            Ok(None) => continue,
+            Ok(Some(accepted)) => accepted,
+            Err((error, _)) => {
+                deny!("invalid SOCKS TLS ClientHello (port {port}): {error}");
+            }
+        };
+        return match accepted.client_hello().server_name() {
+            Some(name) if allowed_tcp_destination(name, port) => Ok(hello),
+            name => deny!("SOCKS TLS server name denied: {name:?}:{port}"),
+        };
+    }
 }
 
 async fn relay_udp_gateway<S: AsyncRead + AsyncWrite + Unpin>(
@@ -385,6 +558,205 @@ mod tests {
     };
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+    fn fixture_tls() -> (TlsAcceptor, Arc<ClientConfig>) {
+        let certificate =
+            CertificateDer::from(include_bytes!("../tests/fixtures/localhost-cert.der").to_vec());
+        let private_key =
+            PrivateKeyDer::try_from(include_bytes!("../tests/fixtures/localhost-key.der").to_vec())
+                .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(
+                include_bytes!("../tests/fixtures/test-ca.der").to_vec(),
+            ))
+            .unwrap();
+        (
+            TlsAcceptor::from(Arc::new(
+                ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(vec![certificate], private_key)
+                    .unwrap(),
+            )),
+            Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            ),
+        )
+    }
+
+    fn client_hello(name: &str, sni: bool) -> Vec<u8> {
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        config.enable_sni = sni;
+        let name = ServerName::try_from(name.to_owned()).unwrap();
+        let mut connection = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+        let mut hello = Vec::new();
+        while connection.wants_write() {
+            connection.write_tls(&mut hello).unwrap();
+        }
+        hello
+    }
+
+    /// Relays `sent` from a client that then disconnects; returns the relay result and
+    /// everything the upstream received.
+    async fn relay_first_bytes(sent: &[u8], port: u16, chunk: usize) -> (Result<()>, Vec<u8>) {
+        let (mut client, mut gateway_client) = tokio::io::duplex(chunk);
+        let (mut gateway_upstream, mut upstream) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move {
+            relay_tls(&mut gateway_client, &mut gateway_upstream, port).await
+        });
+        let sent = sent.to_vec();
+        tokio::spawn(async move { client.write_all(&sent).await });
+        let mut received = Vec::new();
+        upstream.read_to_end(&mut received).await.unwrap();
+        drop(upstream);
+        (relay.await.unwrap(), received)
+    }
+
+    #[tokio::test]
+    async fn allowed_tls_server_name_is_forwarded_byte_for_byte() {
+        for (name, port) in [
+            ("discord.com", 443),
+            ("c-lhr01.example.discord.media", 2053),
+        ] {
+            let mut sent = client_hello(name, true);
+            sent.extend_from_slice(b"\x17\x03\x03\x00\x01X");
+            let (result, received) = relay_first_bytes(&sent, port, 64 * 1024).await;
+            assert!(result.is_ok(), "{name}: {result:?}");
+            assert_eq!(received, sent, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn client_hello_split_across_many_reads_is_accepted() {
+        let sent = client_hello("gateway.discord.gg", true);
+        let (result, received) = relay_first_bytes(&sent, 443, 7).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(received, sent);
+    }
+
+    #[tokio::test]
+    async fn tls_to_a_non_discord_server_name_is_not_relayed() {
+        for (sent, port) in [
+            (client_hello("example.com", true), 443),
+            (client_hello("discord.com.attacker.example", true), 443),
+            (client_hello("discord.com", true), 2053),
+            (client_hello("discord.com", false), 443),
+            (b"GET / HTTP/1.1\r\nHost: discord.com\r\n\r\n".to_vec(), 443),
+            (b"\x17\x03\x03\x00\x05hello".to_vec(), 443),
+        ] {
+            let (result, received) = relay_first_bytes(&sent, port, 64 * 1024).await;
+            assert!(result.is_err(), "relayed {:?}", &sent[..8]);
+            assert!(received.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_client_hello_is_rejected() {
+        let mut sent = vec![0x16, 3, 1, 0x40, 0, 1, 0, 0xff, 0];
+        sent.resize(5 + 0x4000, 0);
+        sent.extend_from_slice(&[0x16, 3, 1, 0x40, 0]);
+        sent.resize(sent.len() + 0x4000, 0);
+        let (result, received) = relay_first_bytes(&sent, 443, 64 * 1024).await;
+        assert!(result.unwrap_err().to_string().contains("too large"));
+        assert!(received.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_errors_back_off_without_stopping_the_gateway() {
+        use io::ErrorKind::*;
+        let mut results = VecDeque::from([
+            Err(io::Error::other("too many open files")),
+            Err(io::Error::from(OutOfMemory)),
+            Err(io::Error::from(ConnectionAborted)),
+            Err(io::Error::other("too many open files")),
+            Err(io::Error::other("too many open files")),
+            Err(io::Error::other("too many open files")),
+            Err(io::Error::other("too many open files")),
+            Ok(7),
+        ]);
+        let started = Instant::now();
+        let accepted = next_connection(|| std::future::ready(results.pop_front().unwrap())).await;
+        assert_eq!(accepted, 7);
+        assert_eq!(started.elapsed(), Duration::from_millis(3500));
+        let started = Instant::now();
+        let mut results = VecDeque::from([Err(io::Error::from(ConnectionReset)), Ok(8)]);
+        assert_eq!(
+            next_connection(|| std::future::ready(results.pop_front().unwrap())).await,
+            8
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnects_and_timeouts_are_not_logged_per_connection() {
+        let (acceptor, client_tls) = fixture_tls();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut tls = acceptor.accept(server).await.unwrap();
+            tls.write_u8(1).await.unwrap();
+            tls.read_u8().await.unwrap_err()
+        });
+        let mut tls = TlsConnector::from(client_tls)
+            .connect(ServerName::try_from("localhost").unwrap(), client)
+            .await
+            .unwrap();
+        tls.read_u8().await.unwrap();
+        drop(tls);
+        let missing_close_notify: Box<dyn Error + Send + Sync> = server.await.unwrap().into();
+        assert!(benign(&*missing_close_notify), "{missing_close_notify}");
+
+        let elapsed = || tokio::time::timeout(Duration::ZERO, std::future::pending::<()>());
+        for error in [
+            elapsed().await.unwrap_err().into(),
+            elapsed()
+                .await
+                .context("TLS client handshake timed out")
+                .unwrap_err(),
+            io::Error::from(io::ErrorKind::ConnectionReset).into(),
+            io::Error::from(io::ErrorKind::BrokenPipe).into(),
+            Err::<(), _>(io::Error::from(io::ErrorKind::UnexpectedEof))
+                .context("TLS client handshake")
+                .unwrap_err(),
+        ] {
+            assert!(benign(&*error), "{error}");
+        }
+        for error in [
+            Box::<dyn Error + Send + Sync>::from("invalid protocol header"),
+            io::Error::from(io::ErrorKind::InvalidData).into(),
+            Err::<(), _>(io::Error::other("corrupt message"))
+                .context("TLS client handshake")
+                .unwrap_err(),
+        ] {
+            assert!(!benign(&*error), "{error}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_log_lines_are_limited_and_counted() {
+        let limiter = LogLimiter::new();
+        assert_eq!(limiter.check(), Some(0));
+        assert_eq!(limiter.check(), None);
+        assert_eq!(limiter.check(), None);
+        tokio::time::advance(LOG_INTERVAL - Duration::from_millis(1)).await;
+        assert_eq!(limiter.check(), None);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(limiter.check(), Some(3));
+        assert_eq!(limiter.check(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_client_hello_times_out() {
+        let (_client, mut gateway_client) = tokio::io::duplex(64);
+        let (mut gateway_upstream, _upstream) = tokio::io::duplex(64);
+        let error = relay_tls(&mut gateway_client, &mut gateway_upstream, 443)
+            .await
+            .unwrap_err();
+        assert!(benign(&*error), "{error}");
+    }
+
     #[tokio::test]
     async fn udp_policy_requires_exact_current_operator_grant() {
         let cfg = test_config();
@@ -530,26 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn tls_public_gateway_accepts_tokenless_client_and_enforces_socks_policy() {
-        let certificate =
-            CertificateDer::from(include_bytes!("../tests/fixtures/localhost-cert.der").to_vec());
-        let root_certificate =
-            CertificateDer::from(include_bytes!("../tests/fixtures/test-ca.der").to_vec());
-        let private_key =
-            PrivateKeyDer::try_from(include_bytes!("../tests/fixtures/localhost-key.der").to_vec())
-                .unwrap();
-        let server_tls = TlsAcceptor::from(Arc::new(
-            ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(vec![certificate.clone()], private_key)
-                .unwrap(),
-        ));
-        let mut roots = RootCertStore::empty();
-        roots.add(root_certificate).unwrap();
-        let client_tls = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        );
+        let (server_tls, client_tls) = fixture_tls();
         let mut config = test_config();
         config.token.clear();
         config.server_tls = Some(server_tls);
