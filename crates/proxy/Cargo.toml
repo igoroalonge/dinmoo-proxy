@@ -27,7 +27,7 @@ x509-parser = { version = "0.18", features = ["verify"] }
 tun = { version = "0.8", features = ["async"] }
 ipstack = "=1.0.1"
 
-# Voice peer ownership checks (src/peer.rs).
+# Voice peer ownership checks (src/peer.rs) and SO_EXCLUSIVEADDRUSE for the SOCKS listener.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
 

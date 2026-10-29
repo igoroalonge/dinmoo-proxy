@@ -204,6 +204,8 @@ async fn relay_packet_stream(
         tokio::net::TcpStream::connect(proxy),
     )
     .await??;
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let [high, low] = socket.local_addr()?.port().to_be_bytes();
     let relay = tokio::time::timeout(Duration::from_secs(10), async {
         control.write_all(&[5, 1, 0]).await?;
         let mut method = [0; 2];
@@ -213,7 +215,10 @@ async fn relay_packet_stream(
                 "SOCKS UDP authentication failed".into(),
             );
         }
-        control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+        // Declare the sending socket so the relay accepts datagrams only from it.
+        control
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, high, low])
+            .await?;
         let reply = crate::socks::read_socks_reply(&mut control).await?;
         if reply[1] != 0 {
             return Err("SOCKS UDP association rejected".into());
@@ -226,7 +231,6 @@ async fn relay_packet_stream(
         Ok(relay)
     })
     .await??;
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
     let mut packet = [0; 1500];
     let mut response = [0; 1500];
     let mut closed = [0];
@@ -420,6 +424,9 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(request[1], 3, "native UDP must use SOCKS UDP ASSOCIATE");
+                let (host, port) = crate::socks::socks_request_target(&request).unwrap();
+                assert_eq!(host, "127.0.0.1", "the request declares its UDP socket");
+                assert_ne!(port, 0);
                 gateway
                     .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
                     .await

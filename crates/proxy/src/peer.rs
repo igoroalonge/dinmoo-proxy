@@ -9,7 +9,6 @@ use std::path::{Component, Path};
 type Check<T = ()> = std::result::Result<T, String>;
 
 /// `peer` is the connecting app's address and `local` our listener's. Fails closed.
-#[allow(dead_code)] // until the voice CONNECT path calls it
 pub async fn verify_voice_peer(peer: SocketAddr, local: SocketAddr) -> bool {
     let reason = match tokio::task::spawn_blocking(move || check(peer, local)).await {
         Ok(Ok(())) => return true,
