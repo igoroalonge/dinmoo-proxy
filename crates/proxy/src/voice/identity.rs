@@ -119,6 +119,7 @@ fn create_private_directory(directory: &Path) -> io::Result<()> {
         if let Some(parent) = directory.parent() {
             fs::create_dir_all(parent)?;
         }
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {

@@ -57,6 +57,8 @@ pub struct Lease {
     pub session: Arc<ServerSession>,
     registry: Registry,
 }
+// Operator listing and termination are served only by the Unix admin socket.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(serde::Serialize)]
 pub struct Summary {
     pub session_id: String,
@@ -118,6 +120,7 @@ impl Registry {
             .cloned()
             .ok_or_else(|| "unknown, terminated, or mismatched client session".into())
     }
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn terminate(&self, id: Id) -> bool {
         let sessions = self.sessions.lock().unwrap();
         if let Some(session) = sessions.get(&id) {
@@ -127,6 +130,7 @@ impl Registry {
             false
         }
     }
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn list(&self) -> Vec<Summary> {
         self.sessions
             .lock()
