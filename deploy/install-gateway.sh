@@ -22,7 +22,7 @@ if token and not re.fullmatch(r'[A-Za-z0-9_-]{32,1024}', token):
 path = pathlib.Path('/etc/dinmoo-proxy/gateway.env')
 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, 'w') as file:
-    file.write(f'DINMOO_PROXY_TOKEN={token}\nDINMOO_TLS_CERT_DER=/etc/dinmoo-proxy/chain-0.der,/etc/dinmoo-proxy/chain-1.der\nDINMOO_TLS_KEY_DER=/etc/dinmoo-proxy/private-key.der\nDINMOO_MAX_SESSIONS=256\nDINMOO_MAX_SESSIONS_PER_IP=16\nDINMOO_CONNECTIONS_PER_IP_PER_MINUTE=120\nDINMOO_IDLE_TIMEOUT_SECS=600\nDINMOO_ADMIN_SOCKET=/run/dinmoo-proxy/admin.sock\n')
+    file.write(f'DINMOO_PROXY_TOKEN={token}\nDINMOO_TLS_CERT_DER=/etc/dinmoo-proxy/chain-0.der,/etc/dinmoo-proxy/chain-1.der\nDINMOO_TLS_KEY_DER=/etc/dinmoo-proxy/private-key.der\nDINMOO_MAX_SESSIONS=128\nDINMOO_MAX_SESSIONS_PER_IP=16\nDINMOO_CONNECTIONS_PER_IP_PER_MINUTE=120\nDINMOO_IDLE_TIMEOUT_SECS=600\nDINMOO_ADMIN_SOCKET=/run/dinmoo-proxy/admin.sock\n')
 PY
 install -m 644 "$unit" /etc/systemd/system/dinmoo-proxy-gateway.service
 mkdir -p /etc/systemd/system/dinmoo-proxy-gateway.service.d
