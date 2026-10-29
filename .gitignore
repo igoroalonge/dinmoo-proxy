@@ -3,3 +3,4 @@
 .secrets/
 /docs/superpowers/
 *.log
+__pycache__/

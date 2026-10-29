@@ -15,3 +15,14 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
+bytes = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+base64 = "0.22"
+x509-parser = { version = "0.18", features = ["verify"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tun = { version = "0.8", features = ["async"] }
+ipstack = "=1.0.1"

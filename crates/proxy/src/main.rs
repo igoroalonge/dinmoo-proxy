@@ -28,6 +28,10 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+mod voice;
+
+#[cfg(target_os = "macos")]
+mod media;
 
 const DEFAULT_MAX_SESSIONS: usize = 1024;
 const MAX_MAX_SESSIONS: usize = 4096;
@@ -44,13 +48,30 @@ struct Config {
     token: String,
     client_tls: Arc<ClientConfig>,
     server_tls: Option<TlsAcceptor>,
-    approved_udp_ips: Arc<tokio::sync::RwLock<HashMap<IpAddr, tokio::time::Instant>>>,
+    media_targets: Arc<tokio::sync::RwLock<Vec<SocketAddr>>>,
+    voice_identity: Option<Arc<voice::identity::VoiceIdentity>>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let first = args.next().unwrap_or_else(|| "client".into());
+    if first == "voice-identity" {
+        let identity = voice::identity::VoiceIdentity::load_or_create(
+            &voice::identity::identity_directory()?,
+        )?;
+        println!(
+            "Voice bridge identity ready; SPKI pin: {}",
+            identity.spki_pin
+        );
+        return Ok(());
+    }
+    if first == "media" {
+        #[cfg(target_os = "macos")]
+        return media::run(args.collect()).await;
+        #[cfg(not(target_os = "macos"))]
+        bail!("native media capture is currently supported only on macOS");
+    }
     if first == "on" || first == "off" {
         let enabled = first == "on";
         set_client_enabled(enabled)?;
@@ -69,13 +90,13 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         match tokio::time::timeout(Duration::from_secs(5), check_discord_route()).await {
-            Ok(Ok(())) => println!("Discord proxy is on; gateway reaches Discord."),
+            Ok(Ok(())) => println!("Discord proxy is on; gateway reaches Discord over TCP. Native media is not verified by this check."),
             _ => bail!("client service is running, but the Discord route is unavailable"),
         }
         return Ok(());
     }
     if first == "--help" || first == "-h" || first == "help" {
-        println!("dinmoo-proxy\nUsage:\n  dinmoo-proxy install\n  dinmoo-proxy install-local\n  dinmoo-proxy check\n  dinmoo-proxy on\n  dinmoo-proxy off\n  dinmoo-proxy status\n  dinmoo-proxy uninstall\n  dinmoo-proxy client [listen-address] [gateway-address]\n  dinmoo-proxy gateway [listen-address]\n  dinmoo-proxy discord [socks5-url]\n\nPublic access: no token required. Optional private gateway: DINMOO_PROXY_TOKEN (minimum 32 bytes); DINMOO_MAX_SESSIONS (default 1024, maximum 4096); gateway also requires DINMOO_TLS_CERT_DER and DINMOO_TLS_KEY_DER files.");
+        println!("dinmoo-proxy\nUsage:\n  dinmoo-proxy install\n  dinmoo-proxy install-local\n  dinmoo-proxy check\n  dinmoo-proxy on\n  dinmoo-proxy off\n  dinmoo-proxy status\n  dinmoo-proxy uninstall\n  dinmoo-proxy client [listen-address] [gateway-address]\n  dinmoo-proxy gateway [listen-address]\n  dinmoo-proxy discord [socks5-url]\n  sudo dinmoo-proxy media <media-ip:port> [...] (experimental macOS)\n\nPublic access: no token required. Optional private gateway: DINMOO_PROXY_TOKEN (minimum 32 bytes); DINMOO_MAX_SESSIONS (default 1024, maximum 4096); gateway also requires DINMOO_TLS_CERT_DER and DINMOO_TLS_KEY_DER files.");
         return Ok(());
     }
     if first == "install" {
@@ -165,8 +186,34 @@ async fn main() -> Result<()> {
         token,
         client_tls,
         server_tls,
-        approved_udp_ips: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        media_targets: Arc::new(tokio::sync::RwLock::new(parse_media_targets(
+            &env::var("DINMOO_MEDIA_TARGETS").unwrap_or_default(),
+        )?)),
+        voice_identity: if mode == "client" {
+            Some(Arc::new(voice::identity::VoiceIdentity::load_or_create(
+                &voice::identity::identity_directory()?,
+            )?))
+        } else {
+            None
+        },
     });
+    if mode == "gateway" {
+        if let Some(path) = env::var_os("DINMOO_MEDIA_TARGETS_FILE") {
+            let path = std::path::PathBuf::from(path);
+            let base = config.media_targets.read().await.clone();
+            reload_media_targets(&config, &base, &path).await?;
+            let cfg = config.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    if let Err(error) = reload_media_targets(&cfg, &base, &path).await {
+                        eprintln!("media target reload: {error}");
+                    }
+                }
+            });
+        }
+    }
     let max_sessions = configured_max_sessions()?;
     let listener = TcpListener::bind(config.listen).await?;
     eprintln!(
@@ -195,6 +242,51 @@ async fn main() -> Result<()> {
             }
         });
     }
+}
+
+fn parse_media_targets(value: &str) -> Result<Vec<SocketAddr>> {
+    let mut targets = Vec::new();
+    for item in value.split(',').filter(|item| !item.trim().is_empty()) {
+        let target: SocketAddr = item.trim().parse()?;
+        if !is_public_ip(target.ip()) || target.port() == 0 {
+            bail!("media targets must be public IP addresses with a nonzero port");
+        }
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+        if targets.len() > 128 {
+            bail!("at most 128 explicit media targets are allowed");
+        }
+    }
+    Ok(targets)
+}
+
+async fn reload_media_targets(
+    cfg: &Config,
+    base: &[SocketAddr],
+    path: &std::path::Path,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut value = String::new();
+    tokio::fs::File::open(path)
+        .await?
+        .take(16385)
+        .read_to_string(&mut value)
+        .await?;
+    if value.len() > 16384 {
+        bail!("media grant file exceeds 16 KiB");
+    }
+    let mut targets = parse_media_targets(&value)?;
+    for target in base {
+        if !targets.contains(target) {
+            targets.push(*target);
+        }
+    }
+    if targets.len() > 128 {
+        bail!("at most 128 combined media targets are allowed");
+    }
+    *cfg.media_targets.write().await = targets;
+    Ok(())
 }
 
 fn configured_max_sessions() -> Result<usize> {
@@ -376,7 +468,16 @@ async fn wait_for_discord_route() -> Result<()> {
 }
 
 async fn check_discord_route() -> Result<()> {
-    let mut stream = TcpStream::connect("127.0.0.1:1080").await?;
+    check_discord_route_at("127.0.0.1:1080".parse()?).await
+}
+
+async fn check_discord_route_at(proxy: SocketAddr) -> Result<()> {
+    let mut stream = TcpStream::connect(proxy).await.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not connect to local SOCKS proxy at {proxy}: {error}"),
+        )
+    })?;
     stream.write_all(&[5, 1, 0]).await?;
     let mut method = [0u8; 2];
     stream.read_exact(&mut method).await?;
@@ -836,31 +937,44 @@ fn restart_discord_direct() -> Result<()> {
 }
 
 fn restart_discord(proxy: &str) -> Result<()> {
-    if !proxy.starts_with("socks5://127.0.0.1:") {
+    let proxy_address = proxy
+        .strip_prefix("socks5://")
+        .ok_or("Discord proxy must use a local loopback SOCKS5 listener")?;
+    let proxy_address: SocketAddr = proxy_address
+        .parse()
+        .map_err(|_| "Discord proxy must be a valid SOCKS5 socket address")?;
+    if !proxy_address.ip().is_loopback() || proxy_address.port() == 0 {
         bail!("Discord proxy must use the local loopback SOCKS5 listener");
     }
+    let mut discord_args = vec![
+        format!("--proxy-server={proxy}"),
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned(),
+    ];
+    let identity =
+        voice::identity::VoiceIdentity::load_or_create(&voice::identity::identity_directory()?)?;
+    discord_args.push(format!(
+        "--ignore-certificate-errors-spki-list={}",
+        identity.spki_pin
+    ));
     #[cfg(target_os = "macos")]
     {
         stop_discord()?;
-        std::process::Command::new(macos_discord_executable()?)
-            .args([
-                &format!("--proxy-server={proxy}"),
-                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-            ])
+        std::process::Command::new("open")
+            .args(["-n", "-a"])
+            .arg(macos_discord_executable()?)
+            .arg("--args")
+            .args(&discord_args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|_| "could not launch Discord; install Discord.app first")?;
+            .map_err(|_| "could not launch Discord through Launch Services")?;
     }
     #[cfg(target_os = "linux")]
     {
         stop_discord()?;
         let status = std::process::Command::new("discord")
-            .args([
-                format!("--proxy-server={proxy}"),
-                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned(),
-            ])
+            .args(&discord_args)
             .spawn();
         if status.is_err() {
             bail!("could not launch Discord; install the 'discord' desktop command first");
@@ -873,14 +987,22 @@ fn restart_discord(proxy: &str) -> Result<()> {
             .status();
         let local = std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA is not set")?;
         let exe = std::path::PathBuf::from(local).join(r"Discord\Update.exe");
-        let status = std::process::Command::new(exe).args(["--processStart", "Discord.exe", "--process-start-args", &format!("--proxy-server={proxy} --force-webrtc-ip-handling-policy=disable_non_proxied_udp")]).spawn();
+        let process_args = discord_args.join(" ");
+        let status = std::process::Command::new(exe)
+            .args([
+                "--processStart",
+                "Discord.exe",
+                "--process-start-args",
+                &process_args,
+            ])
+            .spawn();
         if status.is_err() {
             bail!("could not launch Discord; install the desktop client first");
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        let _ = proxy;
+        let _ = discord_args;
         bail!("Discord launching is unsupported on this operating system");
     }
     Ok(())
@@ -918,7 +1040,8 @@ async fn handle(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
         })
         .await
         .context("gateway authentication timed out")??;
-        return proxy_socks(&mut stream, &mut remote).await;
+        return proxy_socks_with_identity(&mut stream, &mut remote, cfg.voice_identity.as_deref())
+            .await;
     }
     handle_gateway_connection(stream, &cfg).await
 }
@@ -965,12 +1088,25 @@ async fn authenticate_gateway<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg(test)]
 async fn proxy_socks<L, R>(local: &mut L, remote: &mut R) -> Result<()>
 where
     L: AsyncRead + AsyncWrite + Unpin,
     R: AsyncRead + AsyncWrite + Unpin,
 {
-    let request = tokio::time::timeout(SOCKS_HANDSHAKE_TIMEOUT, async {
+    proxy_socks_with_identity(local, remote, None).await
+}
+
+async fn proxy_socks_with_identity<L, R>(
+    local: &mut L,
+    remote: &mut R,
+    identity: Option<&voice::identity::VoiceIdentity>,
+) -> Result<()>
+where
+    L: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut request = tokio::time::timeout(SOCKS_HANDSHAKE_TIMEOUT, async {
         let version = local.read_u8().await?;
         let nmethods = local.read_u8().await? as usize;
         let mut methods = vec![0; nmethods];
@@ -988,6 +1124,23 @@ where
     .await
     .context("SOCKS handshake timed out")??;
     let command = request[1];
+    let (host, port) = socks_request_target(&request)?;
+    if command == 1 && voice::allowed_host(&host) {
+        if let Some(identity) = identity {
+            if !allowed_tcp_destination(&host, port) {
+                reply(local, 2).await?;
+                return Ok(());
+            }
+            request[1] = voice::SOCKS_VOICE_COMMAND;
+            remote.write_all(&request).await?;
+            let response = read_socks_reply(remote).await?;
+            local.write_all(&response).await?;
+            if response[1] != 0 {
+                return Ok(());
+            }
+            return voice::local::run(local, remote, identity, &host, port).await;
+        }
+    }
     remote.write_all(&request).await?;
     match command {
         1 => {
@@ -1089,8 +1242,14 @@ where
     let (mut reader, mut writer) = tokio::io::split(remote);
     let mut peer = None;
     let mut datagram = vec![0; 1500];
+    let mut frames = FrameReader::default();
+    let mut control = [0u8; 1];
     loop {
         tokio::select! {
+            result = local.read(&mut control) => {
+                result?;
+                return Ok(());
+            }
             result = socket.recv_from(&mut datagram) => {
                 let (length, source) = result?;
                 if !source.ip().is_loopback() || length > 1500 { continue; }
@@ -1103,7 +1262,7 @@ where
                     write_frame(&mut writer, &datagram[..length]).await?;
                 }
             }
-            result = read_frame(&mut reader) => {
+            result = frames.read(&mut reader) => {
                 let frame = result?;
                 if let Some(peer) = peer {
                     socket.send_to(&frame, peer).await?;
@@ -1126,14 +1285,40 @@ async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &[u8]) -> Res
     Ok(())
 }
 
+#[cfg(test)]
 async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
-    let length = reader.read_u16().await? as usize;
-    if length == 0 || length > 1500 {
-        bail!("invalid UDP frame length");
+    FrameReader::default().read(reader).await
+}
+
+// A select branch can be cancelled whenever a UDP socket becomes readable.
+// Keep partially received TLS frames across those cancellations.
+#[derive(Default)]
+struct FrameReader {
+    pending: Vec<u8>,
+}
+impl FrameReader {
+    async fn read<R: AsyncRead + Unpin>(&mut self, reader: &mut R) -> Result<Vec<u8>> {
+        loop {
+            if self.pending.len() >= 2 {
+                let length = u16::from_be_bytes([self.pending[0], self.pending[1]]) as usize;
+                if length == 0 || length > 1500 {
+                    bail!("invalid UDP frame length");
+                }
+                if self.pending.len() >= length + 2 {
+                    let frame = self.pending[2..length + 2].to_vec();
+                    self.pending.drain(..length + 2);
+                    return Ok(frame);
+                }
+            }
+            let mut buffer = [0u8; 1502];
+            let capacity = buffer.len() - self.pending.len();
+            let length = reader.read(&mut buffer[..capacity]).await?;
+            if length == 0 {
+                bail!("UDP tunnel closed during frame read");
+            }
+            self.pending.extend_from_slice(&buffer[..length]);
+        }
     }
-    let mut frame = vec![0; length];
-    reader.read_exact(&mut frame).await?;
-    Ok(frame)
 }
 
 async fn handle_socks<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1159,8 +1344,12 @@ async fn handle_socks<S: AsyncRead + AsyncWrite + Unpin>(
     .context("SOCKS handshake timed out")??;
     let command = request[1];
     let (host, port) = socks_request_target(&request)?;
+    if command == voice::SOCKS_VOICE_COMMAND {
+        return voice::gateway::run(stream, cfg, &host, port).await;
+    }
     if command == 1 {
-        if !allowed_destination(&host) {
+        if !allowed_tcp_destination(&host, port) {
+            eprintln!("SOCKS TCP destination denied: {host:?}:{port}");
             reply(stream, 2).await?;
             bail!("destination denied by policy");
         }
@@ -1178,14 +1367,11 @@ async fn handle_socks<S: AsyncRead + AsyncWrite + Unpin>(
                 tokio::time::timeout(DESTINATION_CONNECT_TIMEOUT, TcpStream::connect(address)).await
             {
                 connection.set_nodelay(true)?;
-                target = Some((connection, address.ip()));
+                target = Some(connection);
                 break;
             }
         }
-        if let Some((mut target, ip)) = target {
-            if host.parse::<IpAddr>().is_err() {
-                approve_udp_ip(cfg, ip).await;
-            }
+        if let Some(mut target) = target {
             reply(stream, 0).await?;
             tokio::io::copy_bidirectional_with_sizes(
                 stream,
@@ -1255,6 +1441,7 @@ async fn relay_udp_gateway<S: AsyncRead + AsyncWrite + Unpin>(
     let mut permitted_targets: VecDeque<(SocketAddr, tokio::time::Instant)> = VecDeque::new();
     let mut dns_cache: HashMap<(String, u16), (tokio::time::Instant, Vec<SocketAddr>)> =
         HashMap::new();
+    let mut frames = FrameReader::default();
     loop {
         let (length, source, is_v6) = tokio::select! {
             received = socket_v4.recv_from(&mut buffer_v4) => {
@@ -1265,22 +1452,20 @@ async fn relay_udp_gateway<S: AsyncRead + AsyncWrite + Unpin>(
                 let (length, source) = received?;
                 (length, source, true)
             }
-            frame = read_frame(&mut reader) => {
+            frame = frames.read(&mut reader) => {
                 let packet = frame?;
                 if !valid_socks_udp_packet(&packet) { continue; }
                 let Ok((host, port, payload)) = parse_socks_udp_packet(&packet) else { continue; };
                 if payload.is_empty() { continue; }
-                if let Ok(ip) = host.parse::<IpAddr>() {
-                    if !is_public_ip(ip) || !is_approved_udp_ip(cfg, ip).await { continue; }
-                    approve_udp_ip(cfg, ip).await;
-                } else if !allowed_destination(&host) {
+                if host.parse::<IpAddr>().is_err() && !allowed_destination(&host) {
                     continue;
                 }
                 let addresses = resolve_udp_addresses(&host, port, &mut dns_cache).await;
                 if addresses.is_empty() { continue; }
                 let mut destination = None;
                 for address in addresses {
-                    if !is_public_ip(address.ip()) { continue; }
+                    // DNS resolution and prior TCP use never create UDP authority.
+                    if !allowed_udp_destination(cfg, address).await { continue; }
                     let sent = match address.ip() {
                         IpAddr::V4(_) => socket_v4.send_to(&payload, address).await,
                         IpAddr::V6(_) => match socket_v6.as_ref() {
@@ -1373,27 +1558,8 @@ async fn receive_optional_udp(
     }
 }
 
-async fn is_approved_udp_ip(cfg: &Config, ip: IpAddr) -> bool {
-    let now = tokio::time::Instant::now();
-    let mut approved = cfg.approved_udp_ips.write().await;
-    approved.retain(|_, expires| *expires > now);
-    approved.contains_key(&ip)
-}
-
-async fn approve_udp_ip(cfg: &Config, ip: IpAddr) {
-    let now = tokio::time::Instant::now();
-    let mut approved = cfg.approved_udp_ips.write().await;
-    approved.retain(|_, expires| *expires > now);
-    if approved.len() >= 1024 && !approved.contains_key(&ip) {
-        if let Some(oldest) = approved
-            .iter()
-            .min_by_key(|(_, expires)| *expires)
-            .map(|(ip, _)| *ip)
-        {
-            approved.remove(&oldest);
-        }
-    }
-    approved.insert(ip, now + Duration::from_secs(300));
+async fn allowed_udp_destination(cfg: &Config, destination: SocketAddr) -> bool {
+    is_public_ip(destination.ip()) && cfg.media_targets.read().await.contains(&destination)
 }
 
 fn parse_socks_udp_packet(packet: &[u8]) -> Result<(String, u16, Vec<u8>)> {
@@ -1501,6 +1667,16 @@ fn allowed_destination(host: &str) -> bool {
         || h.ends_with(".discordcdn.com")
         || h.ends_with(".discordapp.net")
 }
+
+fn allowed_tcp_destination(host: &str, port: u16) -> bool {
+    if !allowed_destination(host) {
+        return false;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    port == 443
+        || ((host == "discord.media" || host.ends_with(".discord.media"))
+            && matches!(port, 2053 | 2083 | 2087 | 2096 | 8443))
+}
 async fn reply<S: AsyncWrite + Unpin>(s: &mut S, code: u8) -> Result<()> {
     s.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
     Ok(())
@@ -1543,6 +1719,44 @@ mod tests {
         assert!(!allowed_destination("discord.com.attacker.example"));
         assert!(!allowed_destination("notdiscord.com"));
         assert!(!allowed_destination("discordapp.net.attacker.example"));
+    }
+
+    #[test]
+    fn tcp_policy_restricts_ports_by_service() {
+        assert!(allowed_tcp_destination("discord.com", 443));
+        assert!(allowed_tcp_destination(
+            "c-lhr01.example.discord.media",
+            2053
+        ));
+        assert!(allowed_tcp_destination(
+            "c-lhr01.example.discord.media",
+            2083
+        ));
+        assert!(!allowed_tcp_destination("discord.com", 22));
+        assert!(!allowed_tcp_destination("discord.com", 2053));
+        assert!(!allowed_tcp_destination(
+            "discord.media.attacker.example",
+            443
+        ));
+        assert!(!allowed_tcp_destination("104.29.151.152", 443));
+    }
+
+    #[tokio::test]
+    async fn udp_policy_requires_exact_current_operator_grant() {
+        let cfg = test_config();
+        let endpoint = "104.29.151.152:19317".parse().unwrap();
+        assert!(!allowed_udp_destination(&cfg, endpoint).await);
+        cfg.media_targets.write().await.push(endpoint);
+        assert!(allowed_udp_destination(&cfg, endpoint).await);
+        assert!(!allowed_udp_destination(&cfg, "104.29.151.152:19318".parse().unwrap()).await);
+        assert!(!allowed_udp_destination(&cfg, "104.29.144.166:19317".parse().unwrap()).await);
+        cfg.media_targets.write().await.clear();
+        assert!(!allowed_udp_destination(&cfg, endpoint).await);
+        cfg.media_targets
+            .write()
+            .await
+            .push("127.0.0.1:19317".parse().unwrap());
+        assert!(!allowed_udp_destination(&cfg, "127.0.0.1:19317".parse().unwrap()).await);
     }
 
     #[test]
@@ -1611,6 +1825,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_frame_read_survives_interleaved_datagrams() {
+        for split in 1..6 {
+            let (mut sender, mut receiver) = tokio::io::duplex(64);
+            let wire = [0, 4, 1, 2, 3, 4];
+            let mut frames = FrameReader::default();
+            sender.write_all(&wire[..split]).await.unwrap();
+            // Simulate the UDP socket winning select after a partial TLS read.
+            tokio::select! {
+                biased;
+                result = frames.read(&mut receiver) => panic!("incomplete frame returned: {result:?}"),
+                _ = std::future::ready(()) => {}
+            }
+            sender.write_all(&wire[split..]).await.unwrap();
+            write_frame(&mut sender, &[5, 6]).await.unwrap();
+            assert_eq!(frames.read(&mut receiver).await.unwrap(), [1, 2, 3, 4]);
+            assert_eq!(frames.read(&mut receiver).await.unwrap(), [5, 6]);
+        }
+    }
+
+    #[test]
+    fn media_grants_reject_private_targets_and_zero_ports() {
+        assert!(parse_media_targets("127.0.0.1:19332").is_err());
+        assert!(parse_media_targets("104.29.143.52:0").is_err());
+        let grants = parse_media_targets("104.29.143.52:19332,104.29.143.52:19332").unwrap();
+        assert_eq!(grants.len(), 1);
+        assert!(!grants.contains(&"104.29.143.52:443".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn media_grant_file_replaces_dynamic_endpoints_without_widening_ports() {
+        let cfg = test_config();
+        let base = ["8.8.8.8:1234".parse().unwrap()];
+        let path = std::env::temp_dir().join(format!(
+            "dinmoo-media-grants-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "104.29.151.152:19317").unwrap();
+        reload_media_targets(&cfg, &base, &path).await.unwrap();
+        assert!(cfg
+            .media_targets
+            .read()
+            .await
+            .contains(&"104.29.151.152:19317".parse().unwrap()));
+        std::fs::write(&path, "104.29.144.166:19307").unwrap();
+        reload_media_targets(&cfg, &base, &path).await.unwrap();
+        let targets = cfg.media_targets.read().await.clone();
+        assert_eq!(targets, ["104.29.144.166:19307".parse().unwrap(), base[0]]);
+        std::fs::write(&path, "127.0.0.1:19307").unwrap();
+        assert!(reload_media_targets(&cfg, &base, &path).await.is_err());
+        assert_eq!(*cfg.media_targets.read().await, targets);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn udp_domain_resolution_uses_a_session_cache() {
         let destination: SocketAddr = "1.1.1.1:443".parse().unwrap();
         let mut cache = HashMap::from([(
@@ -1655,6 +1927,96 @@ mod tests {
 
         client_task.await.unwrap().unwrap();
         assert!(gateway_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn voice_socks_request_upgrades_to_pinned_local_websocket_bridge() {
+        use futures_util::{SinkExt, StreamExt};
+        use rustls::pki_types::ServerName;
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        let directory = std::env::temp_dir().join(format!(
+            "dinmoo-voice-client-pipeline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let identity =
+            Arc::new(voice::identity::VoiceIdentity::load_or_create(&directory).unwrap());
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(
+                std::fs::read(directory.join("certificate.der")).unwrap(),
+            ))
+            .unwrap();
+        let client_tls = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let (app, mut local) = tokio::io::duplex(64 * 1024);
+        let (mut remote, gateway) = tokio::io::duplex(64 * 1024);
+        let bridge_identity = identity.clone();
+        let bridge = tokio::spawn(async move {
+            proxy_socks_with_identity(&mut local, &mut remote, Some(&bridge_identity)).await
+        });
+        let mut app = app;
+        let mut gateway = gateway;
+        app.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0; 3];
+        gateway.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 1, 0]);
+        gateway.write_all(&[5, 0]).await.unwrap();
+        let mut method_reply = [0; 2];
+        app.read_exact(&mut method_reply).await.unwrap();
+        assert_eq!(method_reply, [5, 0]);
+
+        let host = b"voice.discord.media";
+        let mut request = vec![5, 1, 0, 3, host.len() as u8];
+        request.extend_from_slice(host);
+        request.extend_from_slice(&443u16.to_be_bytes());
+        app.write_all(&request).await.unwrap();
+        let forwarded = read_socks_request(&mut gateway).await.unwrap();
+        assert_eq!(forwarded[1], voice::SOCKS_VOICE_COMMAND);
+        assert_eq!(
+            socks_request_target(&forwarded).unwrap(),
+            ("voice.discord.media".into(), 443)
+        );
+        gateway
+            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut request_reply = [0; 10];
+        app.read_exact(&mut request_reply).await.unwrap();
+        assert_eq!(request_reply, [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+
+        let tls = TlsConnector::from(client_tls)
+            .connect(ServerName::try_from("voice.discord.media").unwrap(), app)
+            .await
+            .unwrap();
+        let (mut ws, _) = tokio_tungstenite::client_async("wss://voice.discord.media/?v=8", tls)
+            .await
+            .unwrap();
+        let mut gateway_wire = voice::wire::framed(gateway);
+        let path = gateway_wire.next().await.unwrap().unwrap();
+        assert_eq!(
+            voice::wire::unpack(&path).unwrap(),
+            (voice::wire::PATH, b"/?v=8".as_slice())
+        );
+        gateway_wire
+            .send(voice::wire::record(voice::wire::CLOSE, &[]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ws.next().await.unwrap().unwrap(),
+            Message::Close(_)
+        ));
+        assert!(bridge.await.unwrap().is_ok());
+        drop(identity);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -1784,7 +2146,8 @@ mod tests {
             token: "test-token-for-in-memory-protocol".into(),
             client_tls,
             server_tls: None,
-            approved_udp_ips: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            media_targets: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            voice_identity: None,
         }
     }
 }
