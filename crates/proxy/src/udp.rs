@@ -99,6 +99,8 @@ pub(crate) fn parse_socks_udp(packet: &[u8]) -> Result<(Address<'_>, u16, &[u8])
     Ok((address, port, &packet[3 + length..]))
 }
 
+// The owned codec serves the macOS media bridge; the gateway uses the borrowed forms.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn parse_socks_udp_packet(packet: &[u8]) -> Result<(String, u16, Vec<u8>)> {
     let (address, port, payload) = parse_socks_udp(packet)?;
     Ok((address.to_string(), port, payload.to_vec()))
@@ -123,6 +125,7 @@ pub(crate) async fn forward_udp_response<W: AsyncWrite + Unpin>(
     Ok(true)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn encode_socks_udp_packet(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let (header, header_length) = socks_udp_header(source);
     let mut packet = Vec::with_capacity(header_length + payload.len());
