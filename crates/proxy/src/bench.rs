@@ -57,7 +57,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
+use tokio_tungstenite::tungstenite::Message;
 
 const FIXTURE_CERT: &[u8] = include_bytes!("../tests/fixtures/localhost-cert.der");
 const FIXTURE_KEY: &[u8] = include_bytes!("../tests/fixtures/localhost-key.der");
@@ -889,7 +889,13 @@ fn voice_client(flavor: Flavor, prefix: &str, blast: u64, lockstep: u64) -> Vec<
         downstream.extend_from_slice(&[0xa5; PAYLOAD]);
         let downstream = wire::record(wire::UDP_RECV, &downstream);
 
-        // Warm-up pins the Discord socket as the bridge's UDP peer.
+        // IP discovery for the Ready SSRC pins the Discord socket as the bridge's UDP peer.
+        let mut discovery = [0; 74];
+        discovery[..8].copy_from_slice(&[0, 1, 0, 70, 0, 0, 0, 1]);
+        discord.send_to(&discovery, bridge_udp).await.unwrap();
+        let record = from_bridge.next().await.unwrap().unwrap();
+        let (tag, payload) = wire::unpack(&record).unwrap();
+        assert_eq!((tag, &payload[wire::FLOW_ID_LEN..]), (wire::UDP_SEND, &discovery[..]));
         let (warm, rest) =
             udp_to_records(discord.clone(), bridge_udp, from_bridge, wire::UDP_SEND, 100, WINDOW)
                 .await;
@@ -990,9 +996,7 @@ fn bench_voice_gateway_udp() {
                 .connect(localhost(), remote)
                 .await
                 .unwrap();
-            let config = WebSocketConfig::default()
-                .max_message_size(Some(wire::MAX_WS))
-                .max_frame_size(Some(wire::MAX_WS));
+            let config = wire::websocket_config();
             let url = format!("wss://localhost:{}/?v=8", discord_address.port());
             let (ws, _) = tokio_tungstenite::client_async_with_config(url, tls, Some(config))
                 .await
