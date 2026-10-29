@@ -1,7 +1,10 @@
 //! The gateway alone authenticates Discord and selects the media destination.
 use super::wire;
 use futures_util::{SinkExt, StreamExt};
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpStream, UdpSocket},
@@ -19,7 +22,27 @@ struct Flow {
     expires: Instant,
 }
 
+/// Which upstream `Ready` endpoints may receive a UDP grant, and where the grant's
+/// socket binds. Production always uses `PUBLIC_GRANTS`; only the ignored CPU
+/// benchmarks (`crate::bench`) substitute a loopback scope.
+#[derive(Clone, Copy)]
+pub(crate) struct GrantScope {
+    pub allow: fn(IpAddr) -> bool,
+    pub bind_v4: &'static str,
+    pub bind_v6: &'static str,
+}
+const PUBLIC_GRANTS: GrantScope = GrantScope {
+    allow: crate::policy::is_public_ip,
+    bind_v4: "0.0.0.0:0",
+    bind_v6: "[::]:0",
+};
+
+#[cfg(test)]
 fn ready_endpoint(text: &str) -> crate::Result<Option<SocketAddr>> {
+    ready_endpoint_with(text, PUBLIC_GRANTS)
+}
+
+fn ready_endpoint_with(text: &str, scope: GrantScope) -> crate::Result<Option<SocketAddr>> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return Ok(None);
     };
@@ -38,7 +61,7 @@ fn ready_endpoint(text: &str) -> crate::Result<Option<SocketAddr>> {
         .and_then(|v| u16::try_from(v).ok())
         .filter(|v| *v != 0)
         .ok_or("invalid voice Ready port")?;
-    if !crate::policy::is_public_ip(ip) {
+    if !(scope.allow)(ip) {
         return Err("non-public voice Ready destination".into());
     }
     Ok(Some(SocketAddr::new(ip, port)))
@@ -132,8 +155,21 @@ where
 
 async fn relay<S, T>(
     control: &mut tokio_util::codec::Framed<S, tokio_util::codec::LengthDelimitedCodec>,
+    ws: WebSocketStream<T>,
+    trace: bool,
+) -> crate::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    relay_with(control, ws, trace, PUBLIC_GRANTS).await
+}
+
+pub(crate) async fn relay_with<S, T>(
+    control: &mut tokio_util::codec::Framed<S, tokio_util::codec::LengthDelimitedCodec>,
     mut ws: WebSocketStream<T>,
     trace: bool,
+    scope: GrantScope,
 ) -> crate::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -171,13 +207,13 @@ where
                 if let Some(f) = flow.as_mut() { f.expires = Instant::now() + wire::GRANT_TTL; }
                 match message {
                     Message::Text(text) => {
-                        if let Some(endpoint) = ready_endpoint(&text)? {
+                        if let Some(endpoint) = ready_endpoint_with(&text, scope)? {
                             if trace {
                                 eprintln!("voice bridge received Discord Ready for {endpoint}");
                             }
                             drop(flow.take());
                             relay_write(control.send(wire::record(wire::REVOKE, &[]))).await?;
-                            let bind = if endpoint.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+                            let bind = if endpoint.is_ipv4() { scope.bind_v4 } else { scope.bind_v6 };
                             let socket = UdpSocket::bind(bind).await?;
                             let mut id = [0; wire::FLOW_ID_LEN];
                             rustls::crypto::ring::default_provider().secure_random.fill(&mut id).map_err(|_| "flow randomness failed")?;

@@ -15,6 +15,8 @@ use rustls::{
 };
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use tokio_rustls::TlsAcceptor;
+#[cfg(test)]
+mod bench;
 mod desktop;
 mod gateway;
 mod policy;
