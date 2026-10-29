@@ -2,7 +2,7 @@ name: Cross-platform release
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
     tags: ["v*"]
 
 permissions:

@@ -104,6 +104,6 @@ cargo build --locked
 python3 scripts/test-gateway-protection.py  # isolated loopback TLS checks
 ```
 
-Pushing a `v*` tag builds binaries for macOS, Linux, and Windows on x86_64 and arm64, then publishes binaries, terminal installers, and `latest.json` in GitHub Releases. GitHub-hosted CI provides build checks; it does not validate native Discord voice/video behavior. See [download redirect setup](docs/downloads.md) for the optional branded download host.
+Pushing a `v*` tag builds binaries for macOS, Linux, and Windows on x86_64 and arm64, then publishes binaries, terminal installers, and `latest.json` in GitHub Releases. Pushes to `main` and `release/**` branches run the same builds and tests without publishing. GitHub-hosted CI provides build checks; it does not validate native Discord voice/video behavior. See [download redirect setup](docs/downloads.md) for the optional branded download host.
 
 Licensed under [MIT](LICENSE).
