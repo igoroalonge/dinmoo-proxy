@@ -159,6 +159,24 @@ with tempfile.TemporaryDirectory(prefix='dinmoo-sessions-') as directory:
             stream.close()
             raise
 
+    def reconnect(port, previous):
+        # After a session ends the client closes local connections for its backoff
+        # delay, then opens a new session for the next local connection.
+        deadline = time.monotonic() + 8
+        while True:
+            try:
+                stream = association(port)
+            except (AssertionError, OSError):
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.1)
+                continue
+            try:
+                return stream, wait_session(previous)
+            except BaseException:
+                stream.close()
+                raise
+
     with gateway(per_ip=8, rate=120, idle=3, admin_path=admin_path) as (port, _):
         with socket.socket() as reservation:
             reservation.bind(('127.0.0.1', 0))
@@ -172,21 +190,23 @@ with tempfile.TemporaryDirectory(prefix='dinmoo-sessions-') as directory:
             client = subprocess.Popen([str(BINARY), 'client', f'127.0.0.1:{client_port}', f'localhost:{port}'],
                                       env=client_env, stdout=log, stderr=log)
             try:
-                original = wait_session()
-                with association(client_port) as first, association(client_port) as other:
+                # The first local connection opens the session.
+                first, original = reconnect(client_port, None)
+                with first, association(client_port) as other:
                     assert operator('gateway-terminate', original) == 'terminated'
                     assert first.recv(1) == b'', 'operator termination left a local tunnel open'
                     assert other.recv(1) == b'', 'operator termination failed to close every tunnel'
-                replacement = wait_session(original)
+                second, replacement = reconnect(client_port, original)
                 assert client.poll() is None, 'termination killed the client instead of reconnecting'
-                print('PASS: operator termination closes client tunnels and automatically reconnects')
+                print('PASS: operator termination closes client tunnels; the next local connection reconnects')
 
-                with association(client_port) as second:
+                with second:
                     second.settimeout(6)
                     assert second.recv(1) == b'', 'idle client session was not disconnected'
-                wait_session(replacement)
+                third, _ = reconnect(client_port, replacement)
+                third.close()
                 assert client.poll() is None, 'idle termination killed the reconnecting client'
-                print('PASS: aggregate client inactivity terminates the session and reconnects')
+                print('PASS: aggregate client inactivity terminates the session; the next local connection reconnects')
 
             except BaseException:
                 print((directory / 'client.log').read_text(), file=sys.stderr)

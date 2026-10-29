@@ -9,8 +9,9 @@ Loopback only: never contacts Discord or any other internet host.
 
 Benchmarks: cargo test --release --locked -- --ignored --test-threads=1 <filter> --nocapture
 (see crates/proxy/src/bench.rs). Idle: builds the release binary, starts a gateway with
-the test fixtures and a client connected to it on free loopback ports, then samples their
-CPU with ps. Pass --raw FILE to keep every BENCH line.
+the test fixtures and a client on free loopback ports, opens the client's gateway session
+with one local SOCKS greeting, then samples their CPU with ps. Pass --raw FILE to keep
+every BENCH line.
 """
 import argparse
 import os
@@ -146,7 +147,13 @@ def idle(seconds, settle):
                 [str(binary), 'client', f'127.0.0.1:{client_port}', f'localhost:{gateway_port}'],
                 dict(base, DINMOO_TLS_ROOT_DER=str(FIXTURES / 'test-ca.der'),
                      DINMOO_VOICE_IDENTITY_DIR=str(directory / 'voice')),
-                directory / 'client.log', 'client session ready')
+                directory / 'client.log', 'SOCKS listening on')
+            # The client opens its gateway session for the first local connection, and
+            # answers the SOCKS greeting only once that session is up.
+            with socket.create_connection(('127.0.0.1', client_port), timeout=5) as app:
+                app.sendall(b'\x05\x01\x00')
+                if app.recv(2) != b'\x05\x00':
+                    raise SystemExit(f'client session did not open:\n{(directory / "client.log").read_text()}')
             time.sleep(settle)
             before = {name: cpu_seconds(process.pid) for name, process in processes.items()}
             started = time.monotonic()
