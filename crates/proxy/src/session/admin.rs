@@ -104,7 +104,10 @@ mod unix {
         let mut failures = 0u64;
         loop {
             let stream = match accept().await {
-                Ok(stream) => stream,
+                Ok(stream) => {
+                    failures = 0;
+                    stream
+                }
                 // Transient errors such as EMFILE must not disable operator access.
                 Err(error) => {
                     failures = failures.saturating_add(1);
@@ -228,6 +231,33 @@ mod tests {
         client.read_to_string(&mut response).await.unwrap();
         assert_eq!(response, "[]");
         task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_errors_back_off_instead_of_spinning() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let registry = super::super::Registry::new(std::time::Duration::from_secs(600));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let accept = move || {
+            let call = counter.fetch_add(1, Ordering::Relaxed);
+            async move {
+                if call < 50 {
+                    Err(std::io::Error::other("EMFILE"))
+                } else {
+                    std::future::pending().await
+                }
+            }
+        };
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            accept_loop(accept, registry),
+        )
+        .await;
+        assert!(calls.load(Ordering::Relaxed) <= 11);
     }
 
     #[tokio::test]
