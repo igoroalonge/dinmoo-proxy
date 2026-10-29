@@ -553,8 +553,10 @@ mod tests {
             packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
             packet[28..].copy_from_slice(payload);
             let mut sum: u32 = packet[..20]
-                .chunks_exact(2)
-                .map(|word| u16::from_be_bytes([word[0], word[1]]) as u32)
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&word| u16::from_be_bytes(word) as u32)
                 .sum();
             while sum > 0xffff {
                 sum = (sum & 0xffff) + (sum >> 16);

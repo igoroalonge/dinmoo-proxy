@@ -111,8 +111,8 @@ fn proc_net_owners(table: &str, peer: SocketAddr, local: SocketAddr) -> Check<Ve
             8 => Ipv4Addr::from(words.next()??).into(),
             32 => {
                 let mut bytes = [0; 16];
-                for chunk in bytes.chunks_exact_mut(4) {
-                    chunk.copy_from_slice(&words.next()??);
+                for chunk in bytes.as_chunks_mut::<4>().0 {
+                    *chunk = words.next()??;
                 }
                 Ipv6Addr::from(bytes).into()
             }
@@ -180,7 +180,10 @@ fn owner_module_rows(
         )
     };
     Ok(rows
-        .chunks_exact(ROW)
+        .as_chunks::<ROW>()
+        .0
+        .iter()
+        .map(|row| row.as_slice())
         .filter(|row| {
             endpoint(row, LOCAL_ADDR, LOCAL_PORT) == peer
                 && endpoint(row, REMOTE_ADDR, REMOTE_PORT) == local
