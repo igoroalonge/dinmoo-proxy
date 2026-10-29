@@ -20,7 +20,10 @@ pub type Id = [u8; 16];
 const PING: u8 = 1;
 const PONG: u8 = 2;
 const TERMINATE: u8 = 3;
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const CLIENT_PING_INTERVAL: Duration = Duration::from_secs(15);
+// Each side must tolerate one lost or delayed ping before declaring the peer gone.
+const _: () = assert!(CONTROL_TIMEOUT.as_millis() > 2 * CLIENT_PING_INTERVAL.as_millis());
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CLIENTS: usize = 4096;
 
@@ -29,6 +32,16 @@ const MAX_CLIENTS: usize = 4096;
 pub enum Reason {
     Idle = 1,
     Operator = 2,
+}
+impl TryFrom<u8> for Reason {
+    type Error = &'static str;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Idle),
+            2 => Ok(Self::Operator),
+            _ => Err("unknown gateway termination reason"),
+        }
+    }
 }
 
 pub struct ServerSession {
@@ -224,6 +237,35 @@ mod tests {
         assert!(registry
             .attach(first.session.id, first.session.peer)
             .is_err());
+    }
+
+    #[test]
+    fn termination_reasons_round_trip_and_reject_unknown_bytes() {
+        for reason in [Reason::Idle, Reason::Operator] {
+            assert_eq!(Reason::try_from(reason as u8), Ok(reason));
+        }
+        for byte in [0, 3, 255] {
+            assert!(Reason::try_from(byte).is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pings_at_the_client_interval_keep_control_alive_until_they_stop() {
+        let registry = Registry::new(Duration::from_secs(600));
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let task = tokio::spawn(async move {
+            serve_control(&mut server, registry, "1.1.1.1".parse().unwrap()).await
+        });
+        let mut id = [0; 16];
+        client.read_exact(&mut id).await.unwrap();
+        for _ in 0..4 {
+            tokio::time::sleep(CLIENT_PING_INTERVAL).await;
+            client.write_u8(PING).await.unwrap();
+            assert_eq!(client.read_u8().await.unwrap(), PONG);
+        }
+        let silent = Instant::now();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(silent.elapsed(), CONTROL_TIMEOUT);
     }
 
     #[tokio::test(start_paused = true)]

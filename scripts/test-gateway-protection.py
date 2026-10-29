@@ -28,7 +28,7 @@ def gateway(per_ip, rate, idle, admin_path=None):
     environment.update({
         'DINMOO_TLS_CERT_DER': str(FIXTURES / 'localhost-cert.der'),
         'DINMOO_TLS_KEY_DER': str(FIXTURES / 'localhost-key.der'),
-        'DINMOO_MAX_SESSIONS': '4',
+        'DINMOO_MAX_SESSIONS': '6',
         'DINMOO_MAX_SESSIONS_PER_IP': str(per_ip),
         'DINMOO_CONNECTIONS_PER_IP_PER_MINUTE': str(rate),
         'DINMOO_IDLE_TIMEOUT_SECS': str(idle),

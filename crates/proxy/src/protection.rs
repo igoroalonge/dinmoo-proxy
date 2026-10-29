@@ -6,7 +6,10 @@ use std::{
     io,
     net::{IpAddr, Ipv6Addr},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -63,10 +66,14 @@ struct State {
 }
 /// Admission is checked before allocating a TLS session or spawning its task.
 /// A permit releases concurrency even when a task panics or is cancelled.
+/// The last quarter of the global cap only admits sources holding fewer than a
+/// quarter of their per-source cap, so a few addresses cannot fill the gateway.
 pub struct Admission {
     global: usize,
     per_ip: usize,
     rate: usize,
+    reserve: usize,
+    light: usize,
     state: Arc<Mutex<State>>,
 }
 pub struct Permit {
@@ -91,6 +98,8 @@ impl Admission {
             global,
             per_ip,
             rate,
+            reserve: global / 4,
+            light: (per_ip / 4).max(1),
             state: Arc::new(Mutex::new(State {
                 active: 0,
                 sources: HashMap::new(),
@@ -100,29 +109,35 @@ impl Admission {
     pub fn acquire(&self, ip: IpAddr) -> Option<Permit> {
         let ip = source_key(ip);
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap();
-        // Expire only inactive, fully refilled sources. Never discard live counters
-        // or let disconnect/reconnect reset a depleted rate bucket.
-        if !state.sources.contains_key(&ip) {
-            if state.sources.len() >= MAX_TRACKED_SOURCES {
-                state.sources.retain(|_, source| {
-                    source.active != 0
-                        || now.duration_since(source.updated) < Duration::from_secs(60)
-                });
-                if state.sources.len() >= MAX_TRACKED_SOURCES {
-                    return None;
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        // Never discard live counters. Expire inactive, fully refilled sources first;
+        // if none exist, forget the least recent inactive one instead of failing closed,
+        // so rotating sources cannot lock everyone else out.
+        if !state.sources.contains_key(&ip) && state.sources.len() >= MAX_TRACKED_SOURCES {
+            let mut oldest = None;
+            state.sources.retain(|&key, source| {
+                if source.active != 0 {
+                    return true;
                 }
+                if now.duration_since(source.updated) >= Duration::from_secs(60) {
+                    return false;
+                }
+                if oldest.is_none_or(|(_, updated)| source.updated < updated) {
+                    oldest = Some((key, source.updated));
+                }
+                true
+            });
+            if state.sources.len() >= MAX_TRACKED_SOURCES {
+                // No inactive entry: every tracked source holds a permit.
+                state.sources.remove(&oldest?.0);
             }
-            state.sources.insert(
-                ip,
-                Source {
-                    active: 0,
-                    tokens: self.rate as f64,
-                    updated: now,
-                },
-            );
         }
-        let source = state.sources.get_mut(&ip).unwrap();
+        let source = state.sources.entry(ip).or_insert(Source {
+            active: 0,
+            tokens: self.rate as f64,
+            updated: now,
+        });
         source.tokens = (source.tokens
             + now.duration_since(source.updated).as_secs_f64() * self.rate as f64 / 60.0)
             .min(self.rate as f64);
@@ -135,10 +150,15 @@ impl Admission {
         if source.active >= self.per_ip {
             return None;
         }
-        if state.active >= self.global {
+        let limit = if source.active >= self.light {
+            self.global - self.reserve
+        } else {
+            self.global
+        };
+        if state.active >= limit {
             return None;
         }
-        state.sources.get_mut(&ip).unwrap().active += 1;
+        source.active += 1;
         state.active += 1;
         Some(Permit {
             source: ip,
@@ -154,11 +174,26 @@ impl Drop for Permit {
     }
 }
 
+/// Time of the last transfer, kept as milliseconds since `base` so every tunnel of a
+/// client session can record it with one relaxed store instead of a shared lock.
 #[derive(Clone)]
-pub struct Activity(Arc<Mutex<Instant>>);
+pub struct Activity {
+    base: Instant,
+    millis: Arc<AtomicU64>,
+}
 impl Activity {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            millis: Arc::new(AtomicU64::new(0)),
+        }
+    }
     pub fn last(&self) -> Instant {
-        *self.0.lock().unwrap()
+        self.base + Duration::from_millis(self.millis.load(Ordering::Relaxed))
+    }
+    fn touch(&self) {
+        let millis = self.base.elapsed().as_millis() as u64;
+        self.millis.store(millis, Ordering::Relaxed);
     }
 }
 pub struct ActivityStream<S> {
@@ -167,7 +202,7 @@ pub struct ActivityStream<S> {
 }
 impl<S> ActivityStream<S> {
     pub fn new(inner: S) -> (Self, Activity) {
-        let activity = Activity(Arc::new(Mutex::new(Instant::now())));
+        let activity = Activity::new();
         (
             Self {
                 inner,
@@ -179,9 +214,6 @@ impl<S> ActivityStream<S> {
     pub fn with_activity(inner: S, activity: Activity) -> Self {
         Self { inner, activity }
     }
-    fn touch(&self) {
-        *self.activity.0.lock().unwrap() = Instant::now();
-    }
 }
 impl<S: AsyncRead + Unpin> AsyncRead for ActivityStream<S> {
     fn poll_read(
@@ -192,7 +224,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for ActivityStream<S> {
         let before = buf.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
         if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            self.touch();
+            self.activity.touch();
         }
         result
     }
@@ -205,7 +237,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ActivityStream<S> {
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
         if matches!(result, Poll::Ready(Ok(n)) if n > 0) {
-            self.touch();
+            self.activity.touch();
         }
         result
     }
@@ -223,11 +255,11 @@ where
 {
     tokio::pin!(future);
     loop {
-        let deadline = *activity.0.lock().unwrap() + timeout;
+        let deadline = activity.last() + timeout;
         tokio::select! {
             result = &mut future => return result,
             _ = tokio::time::sleep_until(deadline) => {
-                if Instant::now().duration_since(*activity.0.lock().unwrap()) >= timeout {
+                if activity.last().elapsed() >= timeout {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "gateway session idle timeout").into());
                 }
             }
@@ -256,6 +288,28 @@ mod tests {
         let replacement = limits.acquire(ip("1.1.1.1")).unwrap();
         drop((second, other, replacement));
         assert!(limits.acquire(ip("9.9.9.9")).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heavy_sources_leave_a_reserve_for_light_sources() {
+        let limits = Admission::new(128, 32, 120);
+        let fill = |source: String| -> Vec<Permit> {
+            let source = ip(&source);
+            std::iter::from_fn(|| limits.acquire(source))
+                .take(64)
+                .collect()
+        };
+        let held = |permits: &[Vec<Permit>]| permits.iter().map(Vec::len).collect::<Vec<_>>();
+        let mut heavy: Vec<_> = (1..=4).map(|n| fill(format!("10.0.0.{n}"))).collect();
+        assert_eq!(held(&heavy), [32, 32, 32, 8]);
+        let light: Vec<_> = (1..=3).map(|n| fill(format!("192.0.2.{n}"))).collect();
+        assert_eq!(held(&light), [8, 8, 8]);
+        assert!(limits.acquire(ip("198.51.100.1")).is_none());
+        drop(light);
+        assert!(limits.acquire(ip("198.51.100.1")).is_some());
+        assert!(limits.acquire(ip("10.0.0.4")).is_none());
+        heavy.remove(0);
+        assert!(limits.acquire(ip("10.0.0.4")).is_some());
     }
 
     #[tokio::test(start_paused = true)]
@@ -293,19 +347,52 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn source_tracking_is_bounded_and_reclaims_only_idle_refilled_entries() {
+    async fn full_source_table_evicts_least_recent_inactive_entry_and_keeps_live_counters() {
         let limits = Admission::new(10, 2, 2);
+        let tracked = || limits.state.lock().unwrap().sources.len();
         let active = limits.acquire(ip("1.1.1.1")).unwrap();
-        for n in 1..MAX_TRACKED_SOURCES {
+        drop(limits.acquire(ip("2.2.2.2")).unwrap());
+        drop(limits.acquire(ip("2.2.2.2")).unwrap());
+        assert!(limits.acquire(ip("2.2.2.2")).is_none());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for n in 2..MAX_TRACKED_SOURCES {
             let addr = std::net::Ipv4Addr::from(0x08000000 + n as u32);
             drop(limits.acquire(addr.into()).unwrap());
         }
-        assert!(limits.acquire(ip("9.9.9.9")).is_none());
-        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        assert_eq!(tracked(), MAX_TRACKED_SOURCES);
         assert!(limits.acquire(ip("9.9.9.9")).is_some());
+        assert_eq!(tracked(), MAX_TRACKED_SOURCES);
+        // A fresh bucket shows that the depleted, least recent entry was evicted.
+        assert!(limits.acquire(ip("2.2.2.2")).is_some());
         let second = limits.acquire(ip("1.1.1.1")).unwrap();
         assert!(limits.acquire(ip("1.1.1.1")).is_none());
         drop((active, second));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_source_table_refuses_new_sources_only_while_every_entry_is_active() {
+        let limits = Admission::new(MAX_TRACKED_SOURCES + 1, 1, 2);
+        let mut active: Vec<_> = (0..MAX_TRACKED_SOURCES)
+            .map(|n| {
+                let addr = std::net::Ipv4Addr::from(0x08000000 + n as u32);
+                limits.acquire(addr.into()).unwrap()
+            })
+            .collect();
+        assert!(limits.acquire(ip("9.9.9.9")).is_none());
+        active.pop();
+        assert!(limits.acquire(ip("9.9.9.9")).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_inactive_sources_expire_together_when_the_table_fills() {
+        let limits = Admission::new(10, 2, 2);
+        for n in 0..MAX_TRACKED_SOURCES {
+            let addr = std::net::Ipv4Addr::from(0x08000000 + n as u32);
+            drop(limits.acquire(addr.into()).unwrap());
+        }
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(limits.acquire(ip("9.9.9.9")).is_some());
+        assert_eq!(limits.state.lock().unwrap().sources.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -369,6 +456,25 @@ mod tests {
             }
             assert!(task.await.unwrap().is_ok());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_activity_reports_the_latest_transfer_on_any_stream() {
+        let (first, _first_peer) = tokio::io::duplex(64);
+        let (second, mut second_peer) = tokio::io::duplex(64);
+        let (mut first, activity) = ActivityStream::new(first);
+        let mut second = ActivityStream::with_activity(second, activity.clone());
+        let started = Instant::now();
+        assert_eq!(activity.last(), started);
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        first.write_u8(1).await.unwrap();
+        assert_eq!(activity.last(), started + Duration::from_millis(1500));
+        tokio::time::advance(Duration::from_millis(2250)).await;
+        second_peer.write_u8(2).await.unwrap();
+        assert_eq!(second.read_u8().await.unwrap(), 2);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        second.flush().await.unwrap();
+        assert_eq!(activity.last(), started + Duration::from_millis(3750));
     }
 
     #[tokio::test(start_paused = true)]

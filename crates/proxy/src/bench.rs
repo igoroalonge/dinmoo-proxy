@@ -556,7 +556,8 @@ fn packet_sample(
 
 /// Gateway data-tunnel shape: TLS server stream in the session `ActivityStream`, relayed
 /// with `copy_bidirectional_with_sizes` to a loopback TCP echo. All tunnels share one
-/// client session, hence one `Activity` mutex, on a multi-thread runtime.
+/// client session, hence one shared `Activity` timestamp (a single atomic), on a
+/// multi-thread runtime.
 #[test]
 #[ignore = "CPU benchmark; see module docs"]
 fn bench_tcp_tunnel() {
