@@ -122,7 +122,7 @@ async fn run(first: String, mut args: std::iter::Skip<env::Args>) -> Result<()> 
         if enabled {
             desktop::set_client_enabled(true)?;
             desktop::wait_for_discord_route().await?;
-            desktop::restart_discord("socks5://127.0.0.1:1080")?;
+            desktop::restart_discord("socks5://127.0.0.1:1080").await?;
         } else {
             desktop::disable_proxy()?;
         }
@@ -162,7 +162,8 @@ async fn run(first: String, mut args: std::iter::Skip<env::Args>) -> Result<()> 
     if first == "discord" {
         return desktop::restart_discord(
             args.next().as_deref().unwrap_or("socks5://127.0.0.1:1080"),
-        );
+        )
+        .await;
     }
     let mode = first;
     if mode != "client" && mode != "gateway" {

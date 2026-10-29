@@ -146,7 +146,7 @@ pub(crate) async fn install_local(binary: &std::path::Path, token: &str) -> Resu
         let _ = launch_discord_direct();
         return Err(error);
     }
-    restart_discord("socks5://127.0.0.1:1080")
+    restart_discord("socks5://127.0.0.1:1080").await
 }
 
 async fn read_limited_body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
@@ -189,6 +189,25 @@ pub(crate) async fn check_discord_route() -> Result<()> {
 }
 
 pub(crate) async fn check_discord_route_at(proxy: SocketAddr) -> Result<()> {
+    discord_route(proxy).await.map(drop)
+}
+
+/// Discord trusts whatever holds its proxy port, which is free while the client is not
+/// running, so the listener must also belong to this user.
+async fn check_own_route(proxy: SocketAddr) -> Result<()> {
+    let stream = tokio::time::timeout(Duration::from_secs(5), discord_route(proxy))
+        .await
+        .map_err(|_| format!("local SOCKS proxy at {proxy} did not answer"))??;
+    let local = stream.local_addr()?;
+    // The SOCKS reply shows the listener has accepted, so its owner holds that socket now.
+    tokio::task::spawn_blocking(move || crate::peer::verify_owner(proxy, local))
+        .await?
+        .map_err(|reason| format!("the SOCKS listener at {proxy} is not this user's: {reason}"))?;
+    Ok(())
+}
+
+/// A SOCKS CONNECT to discord.com:443 through `proxy`, left open.
+async fn discord_route(proxy: SocketAddr) -> Result<TcpStream> {
     let mut stream = TcpStream::connect(proxy).await.map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -209,7 +228,7 @@ pub(crate) async fn check_discord_route_at(proxy: SocketAddr) -> Result<()> {
     if reply[1] != 0 {
         bail!("gateway returned SOCKS error {}", reply[1]);
     }
-    Ok(())
+    Ok(stream)
 }
 
 pub(crate) fn validate_install_token(token: &str) -> Result<()> {
@@ -733,7 +752,7 @@ pub(crate) fn launch_discord_direct() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn restart_discord(proxy: &str) -> Result<()> {
+pub(crate) async fn restart_discord(proxy: &str) -> Result<()> {
     let proxy_address = proxy
         .strip_prefix("socks5://")
         .ok_or("Discord proxy must use a local loopback SOCKS5 listener")?;
@@ -743,30 +762,48 @@ pub(crate) fn restart_discord(proxy: &str) -> Result<()> {
     if !proxy_address.ip().is_loopback() || proxy_address.port() == 0 {
         bail!("Discord proxy must use the local loopback SOCKS5 listener");
     }
+    #[cfg(target_os = "macos")]
+    let executable = macos_discord_executable()?;
+    // The voice bridge shows its certificate only to a Discord.app that peer.rs trusts.
+    #[cfg(target_os = "macos")]
+    let pinned = crate::peer::trusted_discord(&executable)
+        .inspect_err(|reason| {
+            eprintln!("Voice bridge disabled: {reason}. Install Discord in /Applications or ~/Applications to proxy voice media.")
+        })
+        .is_ok();
+    #[cfg(not(target_os = "macos"))]
+    let pinned = true;
     stop_discord()?;
     let mut discord_args = vec![
         format!("--proxy-server={proxy}"),
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned(),
     ];
-    // A fresh key per launch, so a pin learned from an earlier launch is useless.
-    let identity = match voice::identity::identity_directory()
-        .and_then(|directory| voice::identity::rotate(&directory))
-    {
-        Ok(identity) => identity,
+    // Only this user's proxy, and a fresh key per launch so an earlier pin is useless.
+    let identity = async {
+        check_own_route(proxy_address).await?;
+        if !pinned {
+            return Ok(None);
+        }
+        voice::identity::identity_directory()
+            .and_then(|directory| voice::identity::rotate(&directory))
+            .map(Some)
+    };
+    match identity.await {
+        Ok(Some(identity)) => discord_args.push(format!(
+            "--ignore-certificate-errors-spki-list={}",
+            identity.spki_pin
+        )),
+        Ok(None) => {}
         Err(error) => {
             let _ = launch_discord_direct();
             return Err(error);
         }
-    };
-    discord_args.push(format!(
-        "--ignore-certificate-errors-spki-list={}",
-        identity.spki_pin
-    ));
+    }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
             .args(["-n", "-a"])
-            .arg(macos_discord_executable()?)
+            .arg(executable)
             .arg("--args")
             .args(&discord_args)
             .stdin(std::process::Stdio::null())
@@ -812,6 +849,26 @@ pub(crate) fn restart_discord(proxy: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn own_route_requires_a_listening_socks_proxy_of_this_user() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            socket.write_all(&[5, 0]).await.unwrap();
+            crate::socks::read_socks_request(&mut socket).await.unwrap();
+            crate::socks::reply(&mut socket, 0).await.unwrap();
+            // Hold the connection, as the client does while it relays.
+            let _ = socket.read_u8().await;
+        });
+        check_own_route(proxy).await.unwrap();
+        server.await.unwrap();
+        let error = check_own_route(proxy).await.unwrap_err();
+        assert!(error.to_string().contains("could not connect"), "{error}");
+    }
 
     #[test]
     fn startup_script_names_the_client_it_runs() {

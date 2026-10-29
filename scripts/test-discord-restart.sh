@@ -3,7 +3,8 @@
 set -eu
 binary=${1:?Pass an absolute path to the CLI binary}
 test_dir=$(mktemp -d)
-trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
+socks_pid=
+trap '[ -z "$socks_pid" ] || kill "$socks_pid" 2>/dev/null; rm -rf "$test_dir"' EXIT HUP INT TERM
 export DINMOO_RESTART_TEST_DIR="$test_dir"
 unset DINMOO_VOICE_IDENTITY_DIR
 mkdir "$test_dir/bin"
@@ -32,6 +33,38 @@ printf 'launch\n' >>"$DINMOO_RESTART_TEST_DIR/events"
 printf '%s\n' "$@" >"$DINMOO_RESTART_TEST_DIR/launch"
 SH
 chmod 755 "$test_dir/bin/"* "$test_dir/home/Applications/Discord.app/Contents/MacOS/Discord"
+# A SOCKS proxy run by this user that reaches discord.com, standing in for the client.
+python3 -I -c '
+import socket, sys, threading
+def exact(conn, count):
+    data = b""
+    while len(data) < count:
+        chunk = conn.recv(count - len(data))
+        if not chunk:
+            raise OSError("closed")
+        data += chunk
+    return data
+def serve(conn):
+    with conn:
+        try:
+            exact(conn, 3)
+            conn.sendall(b"\x05\x00")
+            exact(conn, exact(conn, 5)[4] + 2)
+            conn.sendall(b"\x05\x00\x00\x01" + bytes(6))
+            conn.recv(1)
+        except OSError:
+            pass
+server = socket.create_server(("127.0.0.1", 0))
+print(server.getsockname()[1], flush=True)
+while True:
+    threading.Thread(target=serve, args=(server.accept()[0],), daemon=True).start()
+' >"$test_dir/socks-port" &
+socks_pid=$!
+for attempt in $(seq 50); do
+    [ ! -s "$test_dir/socks-port" ] || break
+    sleep 0.1
+done
+proxy="socks5://127.0.0.1:$(cat "$test_dir/socks-port")"
 export HOME="$test_dir/home"
 export PATH="$test_dir/bin:$PATH"
 fail() {
@@ -54,9 +87,9 @@ assert_before() {
 pin() {
     grep -- '--ignore-certificate-errors-spki-list=' "$test_dir/launch" || fail 'Discord launch has no voice pin'
 }
-"$binary" discord
+"$binary" discord "$proxy"
 wait_for_launch
-grep -q -- '--proxy-server=socks5://127.0.0.1:1080' "$test_dir/launch"
+grep -q -- "--proxy-server=$proxy" "$test_dir/launch"
 grep -q -- '--force-webrtc-ip-handling-policy=disable_non_proxied_udp' "$test_dir/launch"
 if grep -q -- '--host-resolver-rules=' "$test_dir/launch"; then
     echo 'FAIL: Discord launch overrides the host resolver' >&2
@@ -65,13 +98,13 @@ fi
 assert_before stop launch
 first_pin=$(pin)
 rm "$test_dir/launch" "$test_dir/events"
-"$binary" discord
+"$binary" discord "$proxy"
 wait_for_launch
 assert_before stop launch
 second_pin=$(pin)
 [ "$second_pin" != "$first_pin" ] || fail 'consecutive Discord launches reused the voice pin'
 rm "$test_dir/launch"
-if DINMOO_RESTART_TEST_ERROR=yes "$binary" discord 2>"$test_dir/error"; then
+if DINMOO_RESTART_TEST_ERROR=yes "$binary" discord "$proxy" 2>"$test_dir/error"; then
     echo 'FAIL: a process-inspection error was ignored' >&2
     exit 1
 fi
@@ -82,7 +115,7 @@ grep -q 'could not check whether Discord has exited' "$test_dir/error"
 voice="$HOME/.config/dinmoo-proxy/voice"
 chmod 755 "$voice"
 rm -f "$test_dir/events"
-if "$binary" discord 2>"$test_dir/error"; then
+if "$binary" discord "$proxy" 2>"$test_dir/error"; then
     fail 'discord ignored a voice identity error'
 fi
 wait_for_launch
@@ -92,6 +125,37 @@ if grep -q -e '--proxy-server=' -e '--ignore-certificate-errors-spki-list=' "$te
     fail 'Discord was relaunched through the proxy after the identity failed to rotate'
 fi
 chmod 700 "$voice"
+rm "$test_dir/launch"
+
+# The voice bridge serves only the bundles peer.rs trusts; a copy elsewhere is not pinned.
+real_bundle="$HOME/Applications/Discord.app"
+mkdir "$test_dir/elsewhere"
+mv "$real_bundle" "$test_dir/elsewhere/Discord.app"
+ln -s "$test_dir/elsewhere/Discord.app" "$real_bundle"
+"$binary" discord "$proxy" 2>"$test_dir/error"
+wait_for_launch
+grep -q -- "--proxy-server=$proxy" "$test_dir/launch" || fail 'an untrusted Discord.app was not proxied'
+if grep -q -- '--ignore-certificate-errors-spki-list=' "$test_dir/launch"; then
+    fail 'an untrusted Discord.app was given the voice pin'
+fi
+grep -q 'Install Discord in /Applications or ~/Applications' "$test_dir/error" || fail 'untrusted bundle not reported'
+rm "$real_bundle" "$test_dir/launch"
+mv "$test_dir/elsewhere/Discord.app" "$real_bundle"
+
+# Without this user's listener on the proxy port, Discord is relaunched directly.
+kill "$socks_pid"
+wait "$socks_pid" 2>/dev/null || true
+socks_pid=
+rm -f "$test_dir/events"
+if "$binary" discord "$proxy" 2>"$test_dir/error"; then
+    fail 'discord launched through a proxy port that nothing holds'
+fi
+wait_for_launch
+assert_before stop launch
+grep -q 'could not connect to local SOCKS proxy' "$test_dir/error" || fail 'missing listener not reported'
+if grep -q -e '--proxy-server=' -e '--ignore-certificate-errors-spki-list=' "$test_dir/launch"; then
+    fail 'Discord was relaunched through a proxy port that nothing holds'
+fi
 rm "$test_dir/launch"
 
 # A Discord carrying the pin must be gone before the client releases its port.
@@ -134,4 +198,5 @@ assert_before stop 'launchctl bootout'
 assert_before 'launchctl bootout' launch
 [ ! -e "$plist" ] || fail 'uninstall left the launch agent'
 echo 'PASS: Discord exit is awaited before launch; each launch rotates the pin; process errors prevent relaunch; a failed rotation relaunches Discord directly'
+echo 'PASS: only a trusted Discord.app gets the pin; without a listener of this user Discord is relaunched directly'
 echo 'PASS: off and uninstall stop Discord before the client and relaunch it directly; a client that cannot be stopped is not reported removed'

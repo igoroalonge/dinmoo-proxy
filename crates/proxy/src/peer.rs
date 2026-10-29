@@ -2,6 +2,7 @@
 //! Chromium accepts the pinned voice key for any host, so only the user's own processes may
 //! see it. macOS also requires the owner to run from Discord.app; that is only a path check,
 //! which a same-user process able to start a bundle binary with an inherited socket gets around.
+//! The CLI uses the same lookups, reversed, to confirm that it pins Discord to this user's proxy.
 use std::net::SocketAddr;
 #[cfg(any(target_os = "macos", test))]
 use std::path::{Component, Path};
@@ -40,8 +41,9 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// The socket whose local end is `peer` and remote end `local` belongs to this user.
 #[cfg(target_os = "linux")]
-fn check(peer: SocketAddr, local: SocketAddr) -> Check {
+pub(crate) fn verify_owner(peer: SocketAddr, local: SocketAddr) -> Check {
     let uid = linux::peer_uid(peer, local)?;
     if uid != effective_uid() {
         return Err(format!("socket belongs to uid {uid}"));
@@ -50,26 +52,47 @@ fn check(peer: SocketAddr, local: SocketAddr) -> Check {
 }
 
 #[cfg(target_os = "macos")]
-fn check(peer: SocketAddr, local: SocketAddr) -> Check {
-    let pid = macos::peer_pid(peer, local)?;
-    let uid = macos::process_uid(pid)?;
-    if uid != effective_uid() {
-        return Err(format!("process {pid} runs as uid {uid}"));
-    }
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    discord_executable(&macos::executable(pid)?, home.as_deref())
-        .map_err(|reason| format!("process {pid}: {reason}"))
+pub(crate) fn verify_owner(peer: SocketAddr, local: SocketAddr) -> Check {
+    owner_pid(peer, local).map(drop)
 }
 
 #[cfg(windows)]
-fn check(peer: SocketAddr, local: SocketAddr) -> Check {
+pub(crate) fn verify_owner(peer: SocketAddr, local: SocketAddr) -> Check {
     let (pid, created) = windows::peer_socket(peer, local)?;
     windows::same_user(pid, created)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn check(_peer: SocketAddr, _local: SocketAddr) -> Check {
+pub(crate) fn verify_owner(_peer: SocketAddr, _local: SocketAddr) -> Check {
     Err("peer ownership checks are unsupported on this OS".into())
+}
+
+#[cfg(target_os = "macos")]
+fn owner_pid(peer: SocketAddr, local: SocketAddr) -> Check<libc::pid_t> {
+    let pid = macos::peer_pid(peer, local)?;
+    let uid = macos::process_uid(pid)?;
+    if uid != effective_uid() {
+        return Err(format!("process {pid} runs as uid {uid}"));
+    }
+    Ok(pid)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check(peer: SocketAddr, local: SocketAddr) -> Check {
+    verify_owner(peer, local)
+}
+
+#[cfg(target_os = "macos")]
+fn check(peer: SocketAddr, local: SocketAddr) -> Check {
+    let pid = owner_pid(peer, local)?;
+    trusted_discord(&macos::executable(pid)?).map_err(|reason| format!("process {pid}: {reason}"))
+}
+
+/// `executable` runs from a Discord.app the voice peer check accepts.
+#[cfg(target_os = "macos")]
+pub(crate) fn trusted_discord(executable: &Path) -> Check {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    discord_executable(executable, home.as_deref())
 }
 
 /// Owner uids of `/proc/net/tcp{,6}` rows whose local end is `peer` and remote end `local`.
@@ -770,6 +793,13 @@ mod tests {
         assert!(windows::same_user(pid, 1).is_err());
         assert!(windows::peer_socket(unused_port(), local).is_err());
         assert!(windows::peer_socket(local, unused_port()).is_err());
+    }
+
+    #[test]
+    fn listener_end_of_a_connection_to_this_process_belongs_to_this_user() {
+        let (_listener, _client, _server, peer, local) = loopback_connection();
+        assert_eq!(verify_owner(local, peer), Ok(()));
+        assert!(verify_owner(unused_port(), peer).is_err());
     }
 
     #[tokio::test]
