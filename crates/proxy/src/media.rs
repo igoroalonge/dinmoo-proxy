@@ -1,21 +1,27 @@
 //! Explicit, foreground macOS media routing. Does not install a default route.
-use crate::{policy::parse_media_targets, Result};
-use std::{collections::BTreeSet, net::IpAddr, process::Command};
+use crate::{policy::parse_media_targets, socks::Address, Result};
+use std::{
+    collections::BTreeSet,
+    net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, SystemTime},
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use tun::AbstractDevice;
 
 pub async fn run(arguments: Vec<String>) -> Result<()> {
-    let watch = if arguments.first().map(String::as_str) == Some("--watch") {
+    let mut watch = if arguments.first().map(String::as_str) == Some("--watch") {
         if arguments.len() != 2 {
             return Err("usage: dinmoo-proxy media --watch <Discord log directory>".into());
         }
-        Some(std::path::PathBuf::from(&arguments[1]))
+        Some(LogWatch::new(PathBuf::from(&arguments[1])))
     } else {
         None
     };
-    let targets = match &watch {
-        Some(directory) => read_media_targets(directory)?,
+    let targets = match &mut watch {
+        Some(watch) => watch.poll()?.unwrap_or_default(),
         None => parse_media_targets(&arguments.join(","))?,
     };
     let proxy = match std::env::var("DINMOO_MEDIA_SOCKS") {
@@ -58,15 +64,24 @@ pub async fn run(arguments: Vec<String>) -> Result<()> {
     });
     let adapter = run_packets(device, proxy, cancellation);
     tokio::pin!(adapter);
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
     let result = loop {
         tokio::select! {
             result = &mut adapter => break result,
             _ = interval.tick(), if watch.is_some() => {
-                let directory = watch.as_ref().expect("watch directory");
-                match read_media_targets(directory).and_then(|targets| routes.sync(&targets)) {
-                    Ok(()) => {},
-                    Err(error) => eprintln!("media endpoint tracking: {error}"),
+                let mut current = watch.take().expect("log watch");
+                let (current, polled) = tokio::task::spawn_blocking(move || {
+                    let polled = current.poll();
+                    (current, polled)
+                })
+                .await?;
+                watch = Some(current);
+                let synced = polled.and_then(|targets| match targets {
+                    Some(targets) => routes.sync(&targets),
+                    None => Ok(()),
+                });
+                if let Err(error) = synced {
+                    eprintln!("media endpoint tracking: {error}");
                 }
             }
         }
@@ -76,13 +91,45 @@ pub async fn run(arguments: Vec<String>) -> Result<()> {
     result
 }
 
-fn read_media_targets(directory: &std::path::Path) -> Result<Vec<std::net::SocketAddr>> {
+const WEBRTC_LOGS: [&str; 2] = ["discord-webrtc_1", "discord-webrtc_0"];
+
+/// Follows Discord's native WebRTC logs, rereading them only after one changes.
+struct LogWatch {
+    directory: PathBuf,
+    seen: Vec<Option<(u64, SystemTime)>>,
+}
+impl LogWatch {
+    fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            seen: Vec::new(),
+        }
+    }
+    /// The current targets, or None while neither log has changed.
+    fn poll(&mut self) -> Result<Option<Vec<SocketAddr>>> {
+        let stamps: Vec<_> = WEBRTC_LOGS
+            .iter()
+            .map(|name| {
+                let metadata = std::fs::metadata(self.directory.join(name)).ok()?;
+                Some((metadata.len(), metadata.modified().ok()?))
+            })
+            .collect();
+        if stamps == self.seen {
+            return Ok(None);
+        }
+        let targets = read_media_targets(&self.directory)?;
+        self.seen = stamps;
+        Ok(Some(targets))
+    }
+}
+
+fn read_media_targets(directory: &Path) -> Result<Vec<SocketAddr>> {
     use std::io::{Read, Seek, SeekFrom};
     if !directory.is_dir() {
         return Err("Discord log directory does not exist or is inaccessible".into());
     }
     let mut text = String::new();
-    for name in ["discord-webrtc_1", "discord-webrtc_0"] {
+    for name in WEBRTC_LOGS {
         let path = directory.join(name);
         let mut file = match std::fs::File::open(path) {
             Ok(file) => file,
@@ -198,7 +245,7 @@ async fn relay_packet_stream(
     mut stream: ipstack::IpStackUdpStream,
     proxy: std::net::SocketAddr,
 ) -> Result<()> {
-    use std::time::Duration;
+    const IDLE: Duration = Duration::from_secs(60);
     let destination = stream.peer_addr();
     let mut control = tokio::time::timeout(
         Duration::from_secs(5),
@@ -235,6 +282,9 @@ async fn relay_packet_stream(
     let mut packet = [0; 1500];
     let mut response = [0; 1500];
     let mut closed = [0];
+    // Only relayed traffic keeps the association open.
+    let idle = tokio::time::sleep(IDLE);
+    tokio::pin!(idle);
     loop {
         tokio::select! {
             length = stream.read(&mut packet) => {
@@ -242,17 +292,19 @@ async fn relay_packet_stream(
                 if length == 0 { break; }
                 let frame = crate::udp::encode_socks_udp_packet(destination, &packet[..length]);
                 if frame.len() <= 1500 { socket.send_to(&frame, relay).await?; }
+                idle.as_mut().reset(tokio::time::Instant::now() + IDLE);
             }
             received = socket.recv_from(&mut response) => {
                 let (length, source) = received?;
                 if source != relay { continue; }
-                let (host, port, payload) = crate::udp::parse_socks_udp_packet(&response[..length])?;
-                if host == destination.ip().to_string() && port == destination.port() {
-                    stream.write_all(&payload).await?;
+                let (host, port, payload) = crate::udp::parse_socks_udp(&response[..length])?;
+                if host == Address::Ip(destination.ip()) && port == destination.port() {
+                    stream.write_all(payload).await?;
+                    idle.as_mut().reset(tokio::time::Instant::now() + IDLE);
                 }
             }
             _ = control.read(&mut closed) => break,
-            _ = tokio::time::sleep(Duration::from_secs(60)) => break,
+            _ = &mut idle => break,
         }
     }
     Ok(())
@@ -376,6 +428,32 @@ mod tests {
             discover_targets("[now] [1] JS console: Sending ping to 104.29.151.152:19317")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn watched_logs_are_reread_only_after_they_change() {
+        let directory = std::env::temp_dir().join(format!(
+            "dinmoo-media-watch-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let line = |port: u16| {
+            format!("[now] [1] (voice_connection.cpp:728): Create connection to 104.29.151.152:{port} with ssrc: 1\n")
+        };
+        let log = directory.join("discord-webrtc_0");
+        std::fs::write(&log, line(19317)).unwrap();
+        let mut watch = LogWatch::new(directory.clone());
+        let first = watch.poll().unwrap();
+        let unchanged = watch.poll().unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        std::io::Write::write_all(&mut file, line(19318).as_bytes()).unwrap();
+        let appended = watch.poll().unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        let target = |port| std::net::SocketAddr::from(([104, 29, 151, 152], port));
+        assert_eq!(first, Some(vec![target(19317)]));
+        assert_eq!(unchanged, None);
+        assert_eq!(appended, Some(vec![target(19317), target(19318)]));
     }
 
     #[tokio::test]
