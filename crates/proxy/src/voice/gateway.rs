@@ -38,7 +38,7 @@ fn ready_endpoint(text: &str) -> crate::Result<Option<SocketAddr>> {
         .and_then(|v| u16::try_from(v).ok())
         .filter(|v| *v != 0)
         .ok_or("invalid voice Ready port")?;
-    if !crate::is_public_ip(ip) {
+    if !crate::policy::is_public_ip(ip) {
         return Err("non-public voice Ready destination".into());
     }
     Ok(Some(SocketAddr::new(ip, port)))
@@ -59,14 +59,14 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     host: &str,
     port: u16,
 ) -> crate::Result<()> {
-    if !super::allowed_host(host) || !crate::allowed_tcp_destination(host, port) {
+    if !super::allowed_host(host) || !crate::policy::allowed_tcp_destination(host, port) {
         return Err("voice destination denied".into());
     }
     let trace = std::env::var("DINMOO_VOICE_TRACE").as_deref() == Ok("1");
     if trace {
         eprintln!("voice bridge opening Discord control WebSocket to {host}:{port}");
     }
-    crate::reply(stream, 0).await?;
+    crate::socks::reply(stream, 0).await?;
     let mut control = wire::framed(stream);
     let first = tokio::time::timeout(Duration::from_secs(10), control.next())
         .await?
@@ -82,7 +82,11 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     )
     .await??
     .collect();
-    if addresses.is_empty() || addresses.iter().any(|a| !crate::is_public_ip(a.ip())) {
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|a| !crate::policy::is_public_ip(a.ip()))
+    {
         return Err("voice DNS destination denied".into());
     }
     let remote = tokio::time::timeout(

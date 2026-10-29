@@ -73,7 +73,7 @@ where
                 let cfg = cfg.clone();
                 tunnels.spawn(async move {
                     let _permit = permit;
-                    crate::handle(stream, cfg, id).await
+                    crate::tunnel::handle(stream, cfg, id).await
                 });
             }
         }
@@ -89,7 +89,7 @@ pub async fn run(cfg: Arc<crate::Config>, maximum: usize) -> crate::Result<()> {
     loop {
         let started = Instant::now();
         let result = async {
-            let mut control = crate::connect_gateway(&cfg, 2).await?;
+            let mut control = crate::tunnel::connect_gateway(&cfg, 2).await?;
             let mut id = [0; 16];
             tokio::time::timeout(WRITE_TIMEOUT, control.read_exact(&mut id)).await??;
             connected(&mut control, id, cfg.clone(), maximum).await

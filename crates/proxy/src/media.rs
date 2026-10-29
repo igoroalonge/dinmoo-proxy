@@ -1,5 +1,5 @@
 //! Explicit, foreground macOS media routing. Does not install a default route.
-use crate::{parse_media_targets, Result};
+use crate::{policy::parse_media_targets, Result};
 use std::{collections::BTreeSet, net::IpAddr, process::Command};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -120,7 +120,7 @@ fn discover_targets(text: &str) -> Vec<std::net::SocketAddr> {
         else {
             continue;
         };
-        if !target.is_ipv4() || !crate::is_public_ip(target.ip()) || target.port() == 0 {
+        if !target.is_ipv4() || !crate::policy::is_public_ip(target.ip()) || target.port() == 0 {
             continue;
         }
         targets.retain(|known| *known != target);
@@ -151,7 +151,7 @@ fn device_configuration() -> tun::Configuration {
 async fn verify_proxy(proxy: std::net::SocketAddr) -> Result<()> {
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        crate::check_discord_route_at(proxy),
+        crate::desktop::check_discord_route_at(proxy),
     )
     .await
     .map_err(|_| format!("SOCKS preflight timed out at {proxy}"))??;
@@ -214,11 +214,11 @@ async fn relay_packet_stream(
             );
         }
         control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-        let reply = crate::read_socks_reply(&mut control).await?;
+        let reply = crate::socks::read_socks_reply(&mut control).await?;
         if reply[1] != 0 {
             return Err("SOCKS UDP association rejected".into());
         }
-        let (host, port) = crate::socks_request_target(&reply)?;
+        let (host, port) = crate::socks::socks_request_target(&reply)?;
         let relay = std::net::SocketAddr::new(host.parse()?, port);
         if !relay.ip().is_loopback() || port == 0 {
             return Err("SOCKS relay must be a loopback endpoint".into());
@@ -235,13 +235,13 @@ async fn relay_packet_stream(
             length = stream.read(&mut packet) => {
                 let length = length?;
                 if length == 0 { break; }
-                let frame = crate::encode_socks_udp_packet(destination, &packet[..length]);
+                let frame = crate::udp::encode_socks_udp_packet(destination, &packet[..length]);
                 if frame.len() <= 1500 { socket.send_to(&frame, relay).await?; }
             }
             received = socket.recv_from(&mut response) => {
                 let (length, source) = received?;
                 if source != relay { continue; }
-                let (host, port, payload) = crate::parse_socks_udp_packet(&response[..length])?;
+                let (host, port, payload) = crate::udp::parse_socks_udp_packet(&response[..length])?;
                 if host == destination.ip().to_string() && port == destination.port() {
                     stream.write_all(&payload).await?;
                 }
@@ -384,12 +384,12 @@ mod tests {
             socket.read_exact(&mut greeting).await.unwrap();
             assert_eq!(greeting, [5, 1, 0]);
             socket.write_all(&[5, 0]).await.unwrap();
-            let request = crate::read_socks_request(&mut socket).await.unwrap();
+            let request = crate::socks::read_socks_request(&mut socket).await.unwrap();
             assert_eq!(
-                crate::socks_request_target(&request).unwrap(),
+                crate::socks::socks_request_target(&request).unwrap(),
                 ("discord.com".into(), 443)
             );
-            crate::reply(&mut socket, 0).await.unwrap();
+            crate::socks::reply(&mut socket, 0).await.unwrap();
         });
         verify_proxy(selected).await.unwrap();
         server.await.unwrap();
@@ -406,10 +406,9 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut application, _) = listener.accept().await.unwrap();
                 let (mut client, mut gateway) = tokio::io::duplex(4096);
-                let relay =
-                    tokio::spawn(
-                        async move { crate::proxy_socks(&mut application, &mut client).await },
-                    );
+                let relay = tokio::spawn(async move {
+                    crate::tunnel::proxy_socks(&mut application, &mut client).await
+                });
                 let mut greeting = [0; 2];
                 gateway.read_exact(&mut greeting).await.unwrap();
                 assert_eq!(greeting[0], 5);
@@ -417,7 +416,9 @@ mod tests {
                 gateway.read_exact(&mut methods).await.unwrap();
                 assert!(methods.contains(&0));
                 gateway.write_all(&[5, 0]).await.unwrap();
-                let request = crate::read_socks_request(&mut gateway).await.unwrap();
+                let request = crate::socks::read_socks_request(&mut gateway)
+                    .await
+                    .unwrap();
                 assert_eq!(request[1], 3, "native UDP must use SOCKS UDP ASSOCIATE");
                 gateway
                     .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
@@ -425,16 +426,18 @@ mod tests {
                     .unwrap();
                 let packet = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
-                    crate::read_frame(&mut gateway),
+                    crate::udp::read_frame(&mut gateway),
                 )
                 .await
                 .expect("adapter never sent UDP frame")
                 .unwrap();
-                let (host, port, received) = crate::parse_socks_udp_packet(&packet).unwrap();
+                let (host, port, received) = crate::udp::parse_socks_udp_packet(&packet).unwrap();
                 assert_eq!(host, "104.29.143.52");
                 assert_eq!(port, 19332);
                 assert_eq!(received, payload);
-                crate::write_frame(&mut gateway, &packet).await.unwrap();
+                crate::udp::write_frame(&mut gateway, &packet)
+                    .await
+                    .unwrap();
                 // Keep the control connection alive until the caller verifies the reply.
                 std::future::pending::<()>().await;
                 relay.abort();
