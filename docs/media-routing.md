@@ -16,20 +16,51 @@ UDP IP and port, and a short expiration. It sends `Ready` to the local client,
 which rewrites the advertised endpoint to a per-call loopback UDP socket. UDP
 packets carry the grant ID through the TLS tunnel; neither the client nor its
 SOCKS request can select a destination. A new allocation or WSS close revokes
-the previous socket/grant. The gateway handles media transport and temporary
-voice-session credentials, while media payload encryption remains end-to-end.
+the previous socket/grant.
 
-This design requires the matching gateway build on the server. A local certificate
-identity is stored under the user's Dinmoo Proxy configuration directory, with
-restricted file permissions on Unix. Discord's per-SPKI Chromium exception is
-needed only for the client-local TLS hop; upstream Discord TLS verification stays
-enabled. The gateway can see temporary voice credentials and call metadata, so
-the feature is opt-in at the product trust level even though the current client
-build routes voice WSS through it by default.
+The loopback socket drops everything until a Discord IP discovery request
+(74 bytes, type 1, carrying the `Ready` SSRC) arrives from a loopback address,
+then accepts only that sender. The pin never moves: Discord repeats discovery
+from new sockets, but SSRCs are small and sequential, so re-pinning would reopen
+the takeover. This narrows the race for the local port; it does not
+authenticate the sender, because any local user can see the port and guess the
+SSRC.
 
-The local protocol tests cover certificate pin material, local TLS/WebSocket
-handshake, Ready rewriting, loopback UDP relay, flow ID/source checks, expiration,
-and preservation of binary DAVE frames. Native acceptance is still needed to
+The gateway is trusted with the call's transport. Discord's session description
+(op 4) gives it the voice `secret_key`, so it can read and forge transport-layer
+RTP/RTCP, including the audio-level and speaking extensions, and can inject
+silence. Media content is end-to-end encrypted only by Discord's DAVE protocol,
+where Discord applies it (not in stage channels). The gateway also sees call
+metadata, the voice session credentials and session IDs. It never receives the
+Discord account token.
+
+This design requires the matching gateway build on the server. The local
+certificate identity is stored under `.config/dinmoo-proxy/voice` in the user's
+home directory, with owner-only permissions on Unix. Every Discord launch made
+by `dinmoo-proxy` replaces it with a new key; if that fails, Discord is
+relaunched without the proxy. A running client reloads the identity when the
+file's content changes.
+
+Chromium's `--ignore-certificate-errors-spki-list` exception is not scoped to the
+client-local hop. Discord's network service accepts any presented chain that
+contains the pinned public key, for every host and without a name check, so
+whoever learns that key and can intercept Discord's TLS could impersonate any
+HTTPS site to Discord. Chains without the pinned key still get normal
+verification, and the gateway verifies Discord's certificate on its own upstream
+WSS. The client therefore completes the local TLS handshake, which reveals the
+certificate, only for a peer the OS reports as the same user: the socket owner
+from `/proc` on Linux, the owning process from libproc on macOS (which must also
+run from Discord.app), and the owner SID on Windows, with the process bound to
+the socket's age. Other peers get a plain tunnel. The client keeps
+127.0.0.1:1080 bound for its whole lifetime, so the port Discord trusts is never
+left free for another process. Because the gateway sees the call's transport and
+metadata, the feature is opt-in at the product trust level even though the
+current client build routes voice WSS through it by default.
+
+The local protocol tests cover certificate pin material, identity rotation, the
+peer-check fallback, local TLS/WebSocket handshake, Ready rewriting, loopback
+UDP relay and discovery pinning, flow ID/source checks, expiration, and
+preservation of binary DAVE frames. Native acceptance is still needed to
 confirm that stock Discord uses this WebSocket path and that a real screen share
 plays successfully.
 
