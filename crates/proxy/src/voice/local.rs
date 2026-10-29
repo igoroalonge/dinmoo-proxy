@@ -200,7 +200,7 @@ where
                         wire::READY => {
                             if payload.len() <= wire::FLOW_ID_LEN { return Err("invalid voice Ready record".into()); }
                             let id = payload[..wire::FLOW_ID_LEN].try_into().unwrap();
-                            let socket = UdpSocket::bind("127.0.0.1:0").await?;
+                            let socket = wire::bind_udp("127.0.0.1:0").await?;
                             let (ready, ssrc) = rewrite_ready(&payload[wire::FLOW_ID_LEN..], socket.local_addr()?.port())?;
                             flow = Some(Flow { id, socket, peer: Peer::new(ssrc) });
                             timeout(WRITE_TIMEOUT, ws.send(Message::Text(ready.into()))).await??;
@@ -209,7 +209,7 @@ where
                             let current = flow.as_ref().ok_or("voice UDP before Ready")?;
                             if let (Some(raw), Some(peer)) = (current.packet(payload), current.peer.pinned) {
                                 // UDP is lossy; a failed send drops one datagram, not the call.
-                                let _ = timeout(WRITE_TIMEOUT, current.socket.send_to(raw, peer)).await;
+                                let _ = current.socket.try_send_to(raw, peer);
                             }
                         }
                         wire::REVOKE if payload.is_empty() => { flow = None; }
@@ -449,14 +449,21 @@ mod tests {
         app.try_send_to(&discovery(41), endpoint).unwrap();
         app.try_send_to(b"early", endpoint).unwrap();
         app.try_send_to(&discovery(42), endpoint).unwrap();
-        attacker.send_to(&discovery(42), endpoint).unwrap();
         app.try_send_to(b"media", endpoint).unwrap();
         for expected in [discovery(42), b"media".to_vec()] {
             let (tag, payload) = next(&mut gateway).await;
             assert_eq!(tag, wire::UDP_SEND);
             assert_eq!(payload[16..], expected[..]);
         }
-        assert_eq!(flush_count(&flushes) - before, 1);
+        // Linux and macOS queue loopback datagrams before send returns, so the burst is one
+        // batch there; `wire` tests the batch bounds without relying on the kernel.
+        if cfg!(not(windows)) {
+            assert_eq!(flush_count(&flushes) - before, 1);
+        }
+        attacker.send_to(&discovery(42), endpoint).unwrap();
+        app.try_send_to(b"more", endpoint).unwrap();
+        let (tag, payload) = next(&mut gateway).await;
+        assert_eq!((tag, &payload[16..]), (wire::UDP_SEND, b"more".as_slice()));
         let mut reply = vec![5; 16];
         reply.extend_from_slice(b"reply");
         gateway

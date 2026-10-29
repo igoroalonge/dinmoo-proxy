@@ -213,7 +213,7 @@ where
                     wire::UDP_SEND => {
                         if let Some(f) = &flow {
                             // UDP is lossy; a failed send drops one datagram, not the call.
-                            if authorized_udp(f, data) { let _ = f.socket.send_to(&data[wire::FLOW_ID_LEN..], f.endpoint).await; }
+                            if authorized_udp(f, data) { let _ = f.socket.try_send_to(&data[wire::FLOW_ID_LEN..], f.endpoint); }
                         }
                     }
                     _ => return Err("invalid voice client record".into()),
@@ -231,7 +231,7 @@ where
                             drop(flow.take());
                             relay_write(control.send(wire::record(wire::REVOKE, &[]))).await?;
                             let bind = if endpoint.is_ipv4() { scope.bind_v4 } else { scope.bind_v6 };
-                            let socket = UdpSocket::bind(bind).await?;
+                            let socket = wire::bind_udp(bind).await?;
                             let mut id = [0; wire::FLOW_ID_LEN];
                             rustls::crypto::ring::default_provider().secure_random.fill(&mut id).map_err(|_| "flow randomness failed")?;
                             let expires = Instant::now() + wire::GRANT_TTL;
@@ -409,7 +409,11 @@ mod tests {
             expected.extend_from_slice(&[byte; 50]);
             assert_eq!(next(&mut client).await, (wire::UDP_RECV, expected));
         }
-        assert_eq!(flush_count(&flushes) - before, 1);
+        // Linux and macOS queue loopback datagrams before send returns, so the burst is one
+        // batch there; `wire` tests the batch bounds without relying on the kernel.
+        if cfg!(not(windows)) {
+            assert_eq!(flush_count(&flushes) - before, 1);
+        }
         close(client, task).await;
     }
 
