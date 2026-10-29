@@ -194,7 +194,7 @@ where
             _ = tokio::time::sleep_until(idle_deadline) => {
                 if session.activity.last().elapsed() >= registry.idle { session.terminate(Reason::Idle); }
             }
-            _ = tokio::time::sleep_until(heartbeat_deadline) => return Err("client control heartbeat timed out".into()),
+            _ = tokio::time::sleep_until(heartbeat_deadline) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "client control heartbeat timed out").into()),
             message = stream.read_u8() => {
                 if message? != PING { return Err("invalid client control message".into()); }
                 tokio::time::timeout(WRITE_TIMEOUT, stream.write_u8(PONG)).await??;

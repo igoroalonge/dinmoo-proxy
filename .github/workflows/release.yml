@@ -6,9 +6,21 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (master)
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
   build:
     strategy:
       fail-fast: false
@@ -40,10 +52,14 @@ jobs:
             ext: .exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (master)
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
+          components: clippy
       - name: Check Unix installer syntax
         if: runner.os != 'Windows'
         run: sh -n scripts/install.sh scripts/local-smoke.sh scripts/test-linux-client.sh scripts/test-discord-restart.sh
@@ -55,6 +71,7 @@ jobs:
           $errors = $null
           [System.Management.Automation.Language.Parser]::ParseFile("$PWD/scripts/install.ps1", [ref]$tokens, [ref]$errors) | Out-Null
           if ($errors.Count -gt 0) { $errors | Format-List; exit 1 }
+      - run: cargo clippy --locked --target ${{ matrix.target }} --all-targets -- -D warnings
       - run: cargo test --locked --target ${{ matrix.target }}
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - shell: bash
@@ -67,19 +84,23 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: sh scripts/test-discord-restart.sh "$PWD/dinmoo-proxy-${{ matrix.key }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.key }}
           path: dinmoo-proxy-${{ matrix.key }}${{ matrix.ext }}
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [fmt, build]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
@@ -106,7 +127,7 @@ jobs:
       - name: Include terminal installers
         run: |
           cp scripts/install.sh scripts/install.ps1 dist/
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           generate_release_notes: true

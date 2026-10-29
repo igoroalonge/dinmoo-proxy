@@ -1,6 +1,28 @@
 //! Destination policy: public IP checks, Discord host allowlist and media grants.
 use crate::Result;
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, RwLock},
+};
+
+/// Operator media grants, checked per UDP packet. Readers hold the lock only briefly
+/// and never across an await.
+#[derive(Clone, Default)]
+pub(crate) struct MediaTargets(Arc<RwLock<Arc<Vec<SocketAddr>>>>);
+impl MediaTargets {
+    pub(crate) fn new(targets: Vec<SocketAddr>) -> Self {
+        Self(Arc::new(RwLock::new(Arc::new(targets))))
+    }
+    pub(crate) fn snapshot(&self) -> Arc<Vec<SocketAddr>> {
+        self.0.read().unwrap().clone()
+    }
+    pub(crate) fn replace(&self, targets: Vec<SocketAddr>) {
+        *self.0.write().unwrap() = Arc::new(targets);
+    }
+    pub(crate) fn contains(&self, target: &SocketAddr) -> bool {
+        self.0.read().unwrap().contains(target)
+    }
+}
 
 pub(crate) fn parse_media_targets(value: &str) -> Result<Vec<SocketAddr>> {
     let mut targets = Vec::new();
@@ -61,29 +83,33 @@ pub(crate) fn is_public_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// `host` is `domain` or one of its subdomains, ignoring ASCII case and trailing dots.
+fn within(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').as_bytes();
+    let Some(split) = host.len().checked_sub(domain.len()) else {
+        return false;
+    };
+    host[split..].eq_ignore_ascii_case(domain.as_bytes()) && (split == 0 || host[split - 1] == b'.')
+}
+
+fn subdomain(host: &str, domain: &str) -> bool {
+    within(host, domain) && host.trim_end_matches('.').len() > domain.len()
+}
+
 pub(crate) fn allowed_destination(host: &str) -> bool {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    h == "discord.com"
-        || h.ends_with(".discord.com")
-        || h == "discordapp.com"
-        || h.ends_with(".discordapp.com")
-        || h == "discord.media"
-        || h.ends_with(".discord.media")
-        || h == "discord.gg"
-        || h.ends_with(".discord.gg")
-        || h == "discordcdn.com"
-        || h.ends_with(".discordcdn.com")
-        || h.ends_with(".discordapp.net")
+    within(host, "discord.com")
+        || within(host, "discordapp.com")
+        || within(host, "discord.media")
+        || within(host, "discord.gg")
+        || within(host, "discordcdn.com")
+        || subdomain(host, "discordapp.net")
 }
 
 pub(crate) fn allowed_tcp_destination(host: &str, port: u16) -> bool {
-    if !allowed_destination(host) {
-        return false;
-    }
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    port == 443
-        || ((host == "discord.media" || host.ends_with(".discord.media"))
-            && matches!(port, 2053 | 2083 | 2087 | 2096 | 8443))
+    allowed_destination(host)
+        && (port == 443
+            || (subdomain(host, "discord.media")
+                && matches!(port, 2053 | 2083 | 2087 | 2096 | 8443)))
 }
 
 #[cfg(test)]
@@ -99,6 +125,11 @@ mod tests {
         assert!(!allowed_destination("discord.com.attacker.example"));
         assert!(!allowed_destination("notdiscord.com"));
         assert!(!allowed_destination("discordapp.net.attacker.example"));
+        assert!(!allowed_destination("discordapp.net"));
+        assert!(!allowed_destination("xdiscord.gg"));
+        assert!(!allowed_destination("."));
+        assert!(!allowed_destination("é.discord.co"));
+        assert!(allowed_destination("é.discord.gg"));
     }
 
     #[test]
@@ -112,6 +143,9 @@ mod tests {
             "c-lhr01.example.discord.media",
             2083
         ));
+        assert!(allowed_tcp_destination("discord.media", 443));
+        assert!(!allowed_tcp_destination("discord.media", 2053));
+        assert!(!allowed_tcp_destination("DISCORD.MEDIA.", 8443));
         assert!(!allowed_tcp_destination("discord.com", 22));
         assert!(!allowed_tcp_destination("discord.com", 2053));
         assert!(!allowed_tcp_destination(
@@ -154,5 +188,19 @@ mod tests {
         let grants = parse_media_targets("104.29.143.52:19332,104.29.143.52:19332").unwrap();
         assert_eq!(grants.len(), 1);
         assert!(!grants.contains(&"104.29.143.52:443".parse().unwrap()));
+    }
+
+    #[test]
+    fn media_target_snapshots_survive_replacement() {
+        let first: SocketAddr = "104.29.143.52:19332".parse().unwrap();
+        let second: SocketAddr = "104.29.143.53:19332".parse().unwrap();
+        let targets = MediaTargets::new(vec![first]);
+        let shared = targets.clone();
+        let snapshot = targets.snapshot();
+        shared.replace(vec![second]);
+        assert!(!targets.contains(&first));
+        assert!(targets.contains(&second));
+        assert_eq!(*snapshot, [first]);
+        assert_eq!(*targets.snapshot(), [second]);
     }
 }

@@ -1,10 +1,17 @@
 //! SOCKS5 UDP packet codec and length-prefixed tunnel framing.
-use crate::Result;
+use crate::{
+    socks::{parse_address, Address},
+    Result,
+};
 use std::net::{IpAddr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+const MAX_FRAME: usize = 1500;
+/// A TLS stream yields at most one 16 KiB record per read.
+const FRAME_READ_BUFFER: usize = 16 * 1024;
+
 pub(crate) fn valid_socks_udp_packet(packet: &[u8]) -> bool {
-    if !(4..=1500).contains(&packet.len()) || packet[..3] != [0, 0, 0] {
+    if !(4..=MAX_FRAME).contains(&packet.len()) || packet[..3] != [0, 0, 0] {
         return false;
     }
     match packet[3] {
@@ -15,12 +22,15 @@ pub(crate) fn valid_socks_udp_packet(packet: &[u8]) -> bool {
     }
 }
 
+/// Writes the length prefix and frame together, so a TLS stream sends one record.
 pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &[u8]) -> Result<()> {
-    if frame.is_empty() || frame.len() > 1500 {
+    if frame.is_empty() || frame.len() > MAX_FRAME {
         bail!("invalid UDP frame length");
     }
-    writer.write_u16(frame.len() as u16).await?;
-    writer.write_all(frame).await?;
+    let mut wire = [0; 2 + MAX_FRAME];
+    wire[..2].copy_from_slice(&(frame.len() as u16).to_be_bytes());
+    wire[2..2 + frame.len()].copy_from_slice(frame);
+    writer.write_all(&wire[..2 + frame.len()]).await?;
     Ok(())
 }
 
@@ -31,100 +41,145 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<V
 
 // A select branch can be cancelled whenever a UDP socket becomes readable.
 // Keep partially received TLS frames across those cancellations.
-#[derive(Default)]
 pub(crate) struct FrameReader {
-    pending: Vec<u8>,
+    buffer: Box<[u8]>,
+    start: usize,
+    end: usize,
+}
+impl Default for FrameReader {
+    fn default() -> Self {
+        Self {
+            buffer: vec![0; FRAME_READ_BUFFER].into(),
+            start: 0,
+            end: 0,
+        }
+    }
 }
 impl FrameReader {
     pub(crate) async fn read<R: AsyncRead + Unpin>(&mut self, reader: &mut R) -> Result<Vec<u8>> {
+        self.next(reader).await.map(<[u8]>::to_vec)
+    }
+
+    /// The next frame, borrowed until the following call.
+    pub(crate) async fn next<R: AsyncRead + Unpin>(&mut self, reader: &mut R) -> Result<&[u8]> {
         loop {
-            if self.pending.len() >= 2 {
-                let length = u16::from_be_bytes([self.pending[0], self.pending[1]]) as usize;
-                if length == 0 || length > 1500 {
+            let pending = &self.buffer[self.start..self.end];
+            if pending.len() >= 2 {
+                let length = u16::from_be_bytes([pending[0], pending[1]]) as usize;
+                if length == 0 || length > MAX_FRAME {
                     bail!("invalid UDP frame length");
                 }
-                if self.pending.len() >= length + 2 {
-                    let frame = self.pending[2..length + 2].to_vec();
-                    self.pending.drain(..length + 2);
-                    return Ok(frame);
+                if pending.len() >= 2 + length {
+                    let frame = self.start + 2..self.start + 2 + length;
+                    self.start = frame.end;
+                    return Ok(&self.buffer[frame]);
                 }
             }
-            let mut buffer = [0u8; 1502];
-            let capacity = buffer.len() - self.pending.len();
-            let length = reader.read(&mut buffer[..capacity]).await?;
+            if self.start == self.end {
+                (self.start, self.end) = (0, 0);
+            } else if self.buffer.len() - self.end < 2 + MAX_FRAME {
+                self.buffer.copy_within(self.start..self.end, 0);
+                (self.start, self.end) = (0, self.end - self.start);
+            }
+            let length = reader.read(&mut self.buffer[self.end..]).await?;
             if length == 0 {
                 bail!("UDP tunnel closed during frame read");
             }
-            self.pending.extend_from_slice(&buffer[..length]);
+            self.end += length;
         }
     }
 }
 
-pub(crate) fn parse_socks_udp_packet(packet: &[u8]) -> Result<(String, u16, Vec<u8>)> {
+/// Borrowed view of a SOCKS UDP packet: destination, port and payload.
+pub(crate) fn parse_socks_udp(packet: &[u8]) -> Result<(Address<'_>, u16, &[u8])> {
     if !valid_socks_udp_packet(packet) {
         bail!("invalid SOCKS UDP packet");
     }
-    let (host, offset) = match packet[3] {
-        1 => (
-            IpAddr::from(<[u8; 4]>::try_from(&packet[4..8])?).to_string(),
-            8,
-        ),
-        4 => (
-            IpAddr::from(<[u8; 16]>::try_from(&packet[4..20])?).to_string(),
-            20,
-        ),
-        3 => {
-            if packet.len() < 5 {
-                bail!("invalid SOCKS UDP domain length");
-            }
-            let n = packet[4] as usize;
-            if packet.len() < 5 + n + 2 {
-                bail!("truncated SOCKS UDP domain");
-            }
-            (std::str::from_utf8(&packet[5..5 + n])?.to_owned(), 5 + n)
-        }
-        _ => bail!("invalid SOCKS UDP address type"),
-    };
-    if packet.len() < offset + 2 {
-        bail!("truncated SOCKS UDP port");
-    }
-    let port = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
-    Ok((host, port, packet[offset + 2..].to_vec()))
+    let (address, port, length) = parse_address(&packet[3..])?;
+    Ok((address, port, &packet[3 + length..]))
 }
 
+// The owned codec serves the macOS media bridge; the gateway uses the borrowed forms.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn parse_socks_udp_packet(packet: &[u8]) -> Result<(String, u16, Vec<u8>)> {
+    let (address, port, payload) = parse_socks_udp(packet)?;
+    Ok((address.to_string(), port, payload.to_vec()))
+}
+
+/// Encodes a reply from `source` and writes it as one frame; oversized replies are dropped.
 pub(crate) async fn forward_udp_response<W: AsyncWrite + Unpin>(
     writer: &mut W,
     source: SocketAddr,
     payload: &[u8],
 ) -> Result<bool> {
-    let response = encode_socks_udp_packet(source, payload);
-    if response.len() > 1500 {
+    let (header, header_length) = socks_udp_header(source);
+    let length = header_length + payload.len();
+    if length > MAX_FRAME {
         return Ok(false);
     }
-    write_frame(writer, &response).await?;
+    let mut wire = [0; 2 + MAX_FRAME];
+    wire[..2].copy_from_slice(&(length as u16).to_be_bytes());
+    wire[2..2 + header_length].copy_from_slice(&header[..header_length]);
+    wire[2 + header_length..2 + length].copy_from_slice(payload);
+    writer.write_all(&wire[..2 + length]).await?;
     Ok(true)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn encode_socks_udp_packet(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let mut packet = vec![0, 0, 0];
-    match source.ip() {
-        IpAddr::V4(ip) => {
-            packet.push(1);
-            packet.extend_from_slice(&ip.octets());
-        }
-        IpAddr::V6(ip) => {
-            packet.push(4);
-            packet.extend_from_slice(&ip.octets());
-        }
-    }
-    packet.extend_from_slice(&source.port().to_be_bytes());
+    let (header, header_length) = socks_udp_header(source);
+    let mut packet = Vec::with_capacity(header_length + payload.len());
+    packet.extend_from_slice(&header[..header_length]);
     packet.extend_from_slice(payload);
     packet
 }
 
+fn socks_udp_header(source: SocketAddr) -> ([u8; 22], usize) {
+    let mut header = [0; 22];
+    let address_end = match source.ip() {
+        IpAddr::V4(ip) => {
+            header[3] = 1;
+            header[4..8].copy_from_slice(&ip.octets());
+            8
+        }
+        IpAddr::V6(ip) => {
+            header[3] = 4;
+            header[4..20].copy_from_slice(&ip.octets());
+            20
+        }
+    };
+    header[address_end..address_end + 2].copy_from_slice(&source.port().to_be_bytes());
+    (header, address_end + 2)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    /// Records every `poll_write` call so tests can count TLS records.
+    #[derive(Default)]
+    pub(crate) struct Writes(pub(crate) Vec<Vec<u8>>);
+    impl AsyncWrite for Writes {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.push(bytes.to_vec());
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn socks_udp_domain_packet_parses_to_host_port_and_payload() {
@@ -136,6 +191,22 @@ mod tests {
         assert_eq!(host, "discord.com");
         assert_eq!(port, 443);
         assert_eq!(payload, b"ab");
+        let (address, port, payload) = parse_socks_udp(&packet).unwrap();
+        assert!(matches!(address, Address::Domain("discord.com")));
+        assert_eq!((port, payload), (443, &b"ab"[..]));
+    }
+
+    #[test]
+    fn socks_udp_ip_packets_parse_without_text_round_trips() {
+        let packet = encode_socks_udp_packet("104.29.151.152:19317".parse().unwrap(), &[7, 8]);
+        let (address, port, payload) = parse_socks_udp(&packet).unwrap();
+        assert_eq!(address, Address::Ip([104, 29, 151, 152].into()));
+        assert_eq!((port, payload), (19317, &[7, 8][..]));
+        let source: SocketAddr = "[2606:4700:4700::1111]:5000".parse().unwrap();
+        let packet = encode_socks_udp_packet(source, &[9]);
+        let (address, port, payload) = parse_socks_udp(&packet).unwrap();
+        assert!(matches!(address, Address::Ip(ip) if ip == source.ip()));
+        assert_eq!((port, payload), (5000, &[9][..]));
     }
 
     #[test]
@@ -181,6 +252,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_frame_is_a_single_write() {
+        let mut writes = Writes::default();
+        write_frame(&mut writes, &[0, 0, 0, 1, 127, 0, 0, 1, 0, 53, 42])
+            .await
+            .unwrap();
+        forward_udp_response(&mut writes, "8.8.8.8:53".parse().unwrap(), &[0xaa])
+            .await
+            .unwrap();
+        assert_eq!(
+            writes.0,
+            [
+                vec![0, 11, 0, 0, 0, 1, 127, 0, 0, 1, 0, 53, 42],
+                vec![0, 11, 0, 0, 0, 1, 8, 8, 8, 8, 0, 53, 0xaa],
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn udp_frames_preserve_packet_boundaries() {
         let (mut sender, mut receiver) = tokio::io::duplex(64);
         write_frame(&mut sender, &[0, 0, 0, 1, 127, 0, 0, 1, 0, 53, 42])
@@ -193,6 +282,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn many_frames_per_read_and_frames_across_buffer_ends_survive() {
+        let (mut sender, mut receiver) = tokio::io::duplex(256 * 1024);
+        let frames: Vec<Vec<u8>> = (0..200u32)
+            .map(|i| vec![i as u8; 1 + (i as usize * 37) % MAX_FRAME])
+            .collect();
+        for frame in &frames {
+            write_frame(&mut sender, frame).await.unwrap();
+        }
+        let mut reader = FrameReader::default();
+        for frame in &frames {
+            assert_eq!(reader.next(&mut receiver).await.unwrap(), &frame[..]);
+        }
+    }
+
+    #[tokio::test]
     async fn udp_frame_read_survives_interleaved_datagrams() {
         for split in 1..6 {
             let (mut sender, mut receiver) = tokio::io::duplex(64);
@@ -202,13 +306,22 @@ mod tests {
             // Simulate the UDP socket winning select after a partial TLS read.
             tokio::select! {
                 biased;
-                result = frames.read(&mut receiver) => panic!("incomplete frame returned: {result:?}"),
+                result = frames.next(&mut receiver) => panic!("incomplete frame returned: {result:?}"),
                 _ = std::future::ready(()) => {}
             }
             sender.write_all(&wire[split..]).await.unwrap();
             write_frame(&mut sender, &[5, 6]).await.unwrap();
-            assert_eq!(frames.read(&mut receiver).await.unwrap(), [1, 2, 3, 4]);
+            assert_eq!(frames.next(&mut receiver).await.unwrap(), [1, 2, 3, 4]);
             assert_eq!(frames.read(&mut receiver).await.unwrap(), [5, 6]);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_lengths_are_rejected() {
+        for wire in [[0, 0, 1], [0x05, 0xdd, 1]] {
+            let (mut sender, mut receiver) = tokio::io::duplex(64);
+            sender.write_all(&wire).await.unwrap();
+            assert!(FrameReader::default().next(&mut receiver).await.is_err());
         }
     }
 }

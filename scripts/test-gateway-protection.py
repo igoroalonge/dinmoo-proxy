@@ -45,7 +45,7 @@ def gateway(per_ip, rate, idle, admin_path=None):
                     if process.poll() is not None or time.monotonic() > deadline:
                         raise AssertionError(f'gateway did not start: {log_path.read_text()}')
                     time.sleep(0.02)
-                yield port
+                yield port, log_path
                 assert process.poll() is None, 'gateway exited during protection checks'
             finally:
                 process.terminate()
@@ -90,7 +90,7 @@ def rejected_before_tls(port):
     raise AssertionError('connection was not rejected before TLS')
 
 
-with gateway(per_ip=1, rate=120, idle=1) as port:
+with gateway(per_ip=1, rate=120, idle=1) as (port, log_path):
     with connect(port) as first:
         first.sendall(b'\x05\x01\x00')
         assert exact(first, 2) == b'\x05\x00'
@@ -103,8 +103,13 @@ with gateway(per_ip=1, rate=120, idle=1) as port:
     with connect(port):
         pass
     print('PASS: per-IP cap rejects before TLS; idle UDP cleanup releases the slot')
+    time.sleep(0.05)
+    # Idle timeouts and closes without TLS close_notify are routine, not per-connection log lines.
+    noisy = [line for line in log_path.read_text().splitlines() if line.startswith('session:')]
+    assert not noisy, f'routine disconnects were logged: {noisy}'
+    print('PASS: routine disconnects and idle timeouts are not logged per connection')
 
-with gateway(per_ip=4, rate=2, idle=5) as port:
+with gateway(per_ip=4, rate=2, idle=5) as (port, _):
     for _ in range(2):
         with connect(port):
             pass
@@ -154,7 +159,7 @@ with tempfile.TemporaryDirectory(prefix='dinmoo-sessions-') as directory:
             stream.close()
             raise
 
-    with gateway(per_ip=8, rate=120, idle=3, admin_path=admin_path) as port:
+    with gateway(per_ip=8, rate=120, idle=3, admin_path=admin_path) as (port, _):
         with socket.socket() as reservation:
             reservation.bind(('127.0.0.1', 0))
             client_port = reservation.getsockname()[1]
