@@ -2,9 +2,9 @@
 use crate::{
     policy::{allowed_destination, allowed_tcp_destination, is_public_ip, parse_media_targets},
     protection, session,
-    socks::{read_socks_request, reply, reply_bound, socks_request_target},
+    socks::{read_socks_request, reply, reply_bound, socks_request_target, Address},
     tunnel::read_string,
-    udp::{forward_udp_response, parse_socks_udp_packet, valid_socks_udp_packet, FrameReader},
+    udp::{forward_udp_response, parse_socks_udp, FrameReader},
     voice, Config, ContextExt, Result, AUTH_HANDSHAKE_TIMEOUT, DESTINATION_CONNECT_TIMEOUT,
     SOCKS_HANDSHAKE_TIMEOUT, TCP_COPY_BUFFER_SIZE, TLS_HANDSHAKE_TIMEOUT,
 };
@@ -36,6 +36,10 @@ macro_rules! deny {
 const CLIENT_HELLO_LIMIT: usize = 16 * 1024 + 4 * 5;
 const ACCEPT_BACKOFF: (Duration, Duration) = (Duration::from_millis(100), Duration::from_secs(1));
 const LOG_INTERVAL: Duration = Duration::from_secs(10);
+const DNS_CACHE_ENTRIES: usize = 256;
+const DNS_CACHE_TTL: Duration = Duration::from_secs(30);
+const REPLY_WINDOW: Duration = Duration::from_secs(30);
+const REPLY_SOURCES: usize = 32;
 
 static ACCEPT_ERRORS: LogLimiter = LogLimiter::new();
 static DENIALS: LogLimiter = LogLimiter::new();
@@ -209,7 +213,7 @@ pub(crate) async fn reload_media_targets(
     if targets.len() > 128 {
         bail!("at most 128 combined media targets are allowed");
     }
-    *cfg.media_targets.write().await = targets;
+    cfg.media_targets.replace(targets);
     Ok(())
 }
 
@@ -314,25 +318,7 @@ async fn handle_socks<S: AsyncRead + AsyncWrite + Unpin>(
             reply(stream, 2).await?;
             deny!("SOCKS TCP destination denied: {host:?}:{port}");
         }
-        let dest = format!("{host}:{port}");
-        let mut target = None;
-        for address in
-            tokio::time::timeout(DESTINATION_CONNECT_TIMEOUT, tokio::net::lookup_host(&dest))
-                .await
-                .context("destination DNS lookup timed out")??
-        {
-            if !is_public_ip(address.ip()) {
-                continue;
-            }
-            if let Ok(Ok(connection)) =
-                tokio::time::timeout(DESTINATION_CONNECT_TIMEOUT, TcpStream::connect(address)).await
-            {
-                connection.set_nodelay(true)?;
-                target = Some(connection);
-                break;
-            }
-        }
-        let Some(mut target) = target else {
+        let Some(mut target) = connect_destination(cfg, &host, port).await? else {
             reply(stream, 5).await?;
             bail!("Discord destination did not resolve to a reachable public address");
         };
@@ -348,6 +334,66 @@ async fn handle_socks<S: AsyncRead + AsyncWrite + Unpin>(
     }
     reply(stream, 7).await?;
     bail!("unsupported SOCKS command");
+}
+
+async fn connect_destination(cfg: &Config, host: &str, port: u16) -> Result<Option<TcpStream>> {
+    for &ip in cfg.dns.resolve(host, port).await?.iter() {
+        if let Ok(Ok(connection)) =
+            tokio::time::timeout(DESTINATION_CONNECT_TIMEOUT, TcpStream::connect((ip, port))).await
+        {
+            connection.set_nodelay(true)?;
+            return Ok(Some(connection));
+        }
+    }
+    Ok(None)
+}
+
+/// Public addresses of allowlisted Discord names, shared by every session so most
+/// connections skip the blocking-pool `getaddrinfo`.
+#[derive(Default)]
+pub(crate) struct DnsCache(Mutex<HashMap<Box<str>, DnsEntry>>);
+type DnsEntry = (Instant, Arc<[IpAddr]>);
+impl DnsCache {
+    /// Failed and empty lookups are never cached.
+    pub(crate) async fn resolve(&self, host: &str, port: u16) -> io::Result<Arc<[IpAddr]>> {
+        if let Some(addresses) = self.get(host, Instant::now()) {
+            return Ok(addresses);
+        }
+        let addresses: Arc<[IpAddr]> = tokio::time::timeout(
+            DESTINATION_CONNECT_TIMEOUT,
+            tokio::net::lookup_host((host, port)),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "destination DNS lookup timed out"))??
+        .map(|address| address.ip())
+        .filter(|ip| is_public_ip(*ip))
+        .collect();
+        if !addresses.is_empty() && allowed_destination(host) {
+            self.insert(host, addresses.clone(), Instant::now());
+        }
+        Ok(addresses)
+    }
+    fn get(&self, host: &str, now: Instant) -> Option<Arc<[IpAddr]>> {
+        let entries = self.0.lock().unwrap();
+        let (expires, addresses) = entries.get(host)?;
+        (*expires > now).then(|| addresses.clone())
+    }
+    fn insert(&self, host: &str, addresses: Arc<[IpAddr]>, now: Instant) {
+        let mut entries = self.0.lock().unwrap();
+        if entries.len() >= DNS_CACHE_ENTRIES && !entries.contains_key(host) {
+            entries.retain(|_, (expires, _)| *expires > now);
+            if entries.len() >= DNS_CACHE_ENTRIES {
+                let oldest = entries
+                    .iter()
+                    .min_by_key(|(_, (expires, _))| *expires)
+                    .map(|(host, _)| host.clone());
+                if let Some(oldest) = oldest {
+                    entries.remove(&oldest);
+                }
+            }
+        }
+        entries.insert(host.into(), (now + DNS_CACHE_TTL, addresses));
+    }
 }
 
 /// Relays a client TLS connection once its ClientHello names an allowed host. The SOCKS
@@ -412,6 +458,26 @@ async fn read_client_hello<S: AsyncRead + Unpin>(stream: &mut S, port: u16) -> R
     }
 }
 
+/// Only destinations an association recently sent to may answer it.
+#[derive(Default)]
+struct ReplyFilter(VecDeque<(SocketAddr, Instant)>);
+impl ReplyFilter {
+    fn sent(&mut self, destination: SocketAddr, now: Instant) {
+        self.0.retain(|(peer, seen)| {
+            *peer != destination && now.duration_since(*seen) <= REPLY_WINDOW
+        });
+        if self.0.len() >= REPLY_SOURCES {
+            self.0.pop_front();
+        }
+        self.0.push_back((destination, now));
+    }
+    fn permits(&self, source: SocketAddr, now: Instant) -> bool {
+        self.0
+            .iter()
+            .any(|(peer, seen)| *peer == source && now.duration_since(*seen) <= REPLY_WINDOW)
+    }
+}
+
 async fn relay_udp_gateway<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     socket_v4: UdpSocket,
@@ -421,9 +487,7 @@ async fn relay_udp_gateway<S: AsyncRead + AsyncWrite + Unpin>(
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut buffer_v4 = vec![0; 1501];
     let mut buffer_v6 = vec![0; 1501];
-    let mut permitted_targets: VecDeque<(SocketAddr, tokio::time::Instant)> = VecDeque::new();
-    let mut dns_cache: HashMap<(String, u16), (tokio::time::Instant, Vec<SocketAddr>)> =
-        HashMap::new();
+    let mut replies = ReplyFilter::default();
     let mut frames = FrameReader::default();
     loop {
         let (length, source, is_v6) = tokio::select! {
@@ -435,99 +499,71 @@ async fn relay_udp_gateway<S: AsyncRead + AsyncWrite + Unpin>(
                 let (length, source) = received?;
                 (length, source, true)
             }
-            frame = frames.read(&mut reader) => {
-                let packet = frame?;
-                if !valid_socks_udp_packet(&packet) { continue; }
-                let Ok((host, port, payload)) = parse_socks_udp_packet(&packet) else { continue; };
-                if payload.is_empty() { continue; }
-                if host.parse::<IpAddr>().is_err() && !allowed_destination(&host) {
-                    continue;
-                }
-                let addresses = resolve_udp_addresses(&host, port, &mut dns_cache).await;
-                if addresses.is_empty() { continue; }
-                let mut destination = None;
-                for address in addresses {
-                    // DNS resolution and prior TCP use never create UDP authority.
-                    if !allowed_udp_destination(cfg, address).await { continue; }
-                    let sent = match address.ip() {
-                        IpAddr::V4(_) => socket_v4.send_to(&payload, address).await,
-                        IpAddr::V6(_) => match socket_v6.as_ref() {
-                            Some(socket) => socket.send_to(&payload, address).await,
-                            None => continue,
-                        },
-                    };
-                    if sent.is_ok() {
-                        destination = Some(address);
-                        break;
-                    }
-                }
-                if let Some(destination) = destination {
-                    let now = tokio::time::Instant::now();
-                    permitted_targets.retain(|(_, seen)| now.duration_since(*seen) <= Duration::from_secs(30));
-                    if let Some(entry) = permitted_targets.iter_mut().find(|(peer, _)| *peer == destination) {
-                        entry.1 = now;
-                    } else {
-                        if permitted_targets.len() >= 32 { permitted_targets.pop_front(); }
-                        permitted_targets.push_back((destination, now));
-                    }
+            frame = frames.next(&mut reader) => {
+                let sockets = (&socket_v4, socket_v6.as_ref());
+                if let Some(destination) = send_udp_frame(frame?, sockets, cfg).await {
+                    replies.sent(destination, Instant::now());
                 }
                 continue;
             }
         };
-        let buffer = if is_v6 { &buffer_v6 } else { &buffer_v4 };
-        let now = tokio::time::Instant::now();
-        permitted_targets.retain(|(_, seen)| now.duration_since(*seen) <= Duration::from_secs(30));
-        if !permitted_targets.iter().any(|(peer, _)| *peer == source) {
+        if !replies.permits(source, Instant::now()) {
             continue;
         }
+        let buffer = if is_v6 { &buffer_v6 } else { &buffer_v4 };
         forward_udp_response(&mut writer, source, &buffer[..length]).await?;
     }
 }
 
-async fn resolve_udp_addresses(
-    host: &str,
-    port: u16,
-    cache: &mut HashMap<(String, u16), (tokio::time::Instant, Vec<SocketAddr>)>,
-) -> Vec<SocketAddr> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return vec![SocketAddr::new(ip, port)];
+/// Sends one client datagram and returns the destination that accepted it.
+async fn send_udp_frame(
+    packet: &[u8],
+    sockets: (&UdpSocket, Option<&UdpSocket>),
+    cfg: &Config,
+) -> Option<SocketAddr> {
+    let (host, port, payload) = parse_socks_udp(packet).ok()?;
+    if payload.is_empty() {
+        return None;
     }
-    let key = (host.to_owned(), port);
-    let now = tokio::time::Instant::now();
-    if let Some((expires, addresses)) = cache.get(&key) {
-        if *expires > now {
-            return addresses.clone();
-        }
-    }
-    cache.remove(&key);
-    let Ok(Ok(addresses)) = tokio::time::timeout(
-        DESTINATION_CONNECT_TIMEOUT,
-        tokio::net::lookup_host((host, port)),
-    )
-    .await
-    else {
-        return Vec::new();
-    };
-    let addresses = addresses
-        .filter(|address| is_public_ip(address.ip()))
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return addresses;
-    }
-    if cache.len() >= 32 {
-        cache.retain(|_, (expires, _)| *expires > now);
-        if cache.len() >= 32 {
-            if let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, (expires, _))| *expires)
-                .map(|(key, _)| key.clone())
-            {
-                cache.remove(&oldest);
+    let ip = match host {
+        Address::Ip(ip) => ip,
+        Address::Domain(name) => match name.parse() {
+            Ok(ip) => ip,
+            Err(_) if allowed_destination(name) => {
+                let addresses = cfg.dns.resolve(name, port).await.ok()?;
+                for &ip in addresses.iter() {
+                    let destination = SocketAddr::new(ip, port);
+                    if send_granted(destination, payload, sockets, cfg).await {
+                        return Some(destination);
+                    }
+                }
+                return None;
             }
-        }
+            Err(_) => return None,
+        },
+    };
+    let destination = SocketAddr::new(ip, port);
+    send_granted(destination, payload, sockets, cfg)
+        .await
+        .then_some(destination)
+}
+
+async fn send_granted(
+    destination: SocketAddr,
+    payload: &[u8],
+    (socket_v4, socket_v6): (&UdpSocket, Option<&UdpSocket>),
+    cfg: &Config,
+) -> bool {
+    // DNS resolution and prior TCP use never create UDP authority.
+    if !allowed_udp_destination(cfg, destination) {
+        return false;
     }
-    cache.insert(key, (now + Duration::from_secs(30), addresses.clone()));
-    addresses
+    let socket = match (destination, socket_v6) {
+        (SocketAddr::V4(_), _) => socket_v4,
+        (SocketAddr::V6(_), Some(socket)) => socket,
+        (SocketAddr::V6(_), None) => return false,
+    };
+    socket.send_to(payload, destination).await.is_ok()
 }
 
 async fn receive_optional_udp(
@@ -540,8 +576,8 @@ async fn receive_optional_udp(
     }
 }
 
-async fn allowed_udp_destination(cfg: &Config, destination: SocketAddr) -> bool {
-    is_public_ip(destination.ip()) && cfg.media_targets.read().await.contains(&destination)
+fn allowed_udp_destination(cfg: &Config, destination: SocketAddr) -> bool {
+    is_public_ip(destination.ip()) && cfg.media_targets.contains(&destination)
 }
 
 #[cfg(test)]
@@ -757,22 +793,29 @@ mod tests {
         assert!(benign(&*error), "{error}");
     }
 
-    #[tokio::test]
-    async fn udp_policy_requires_exact_current_operator_grant() {
+    #[test]
+    fn udp_policy_requires_exact_current_operator_grant() {
         let cfg = test_config();
         let endpoint = "104.29.151.152:19317".parse().unwrap();
-        assert!(!allowed_udp_destination(&cfg, endpoint).await);
-        cfg.media_targets.write().await.push(endpoint);
-        assert!(allowed_udp_destination(&cfg, endpoint).await);
-        assert!(!allowed_udp_destination(&cfg, "104.29.151.152:19318".parse().unwrap()).await);
-        assert!(!allowed_udp_destination(&cfg, "104.29.144.166:19317".parse().unwrap()).await);
-        cfg.media_targets.write().await.clear();
-        assert!(!allowed_udp_destination(&cfg, endpoint).await);
+        assert!(!allowed_udp_destination(&cfg, endpoint));
+        cfg.media_targets.replace(vec![endpoint]);
+        assert!(allowed_udp_destination(&cfg, endpoint));
+        assert!(!allowed_udp_destination(
+            &cfg,
+            "104.29.151.152:19318".parse().unwrap()
+        ));
+        assert!(!allowed_udp_destination(
+            &cfg,
+            "104.29.144.166:19317".parse().unwrap()
+        ));
+        cfg.media_targets.replace(Vec::new());
+        assert!(!allowed_udp_destination(&cfg, endpoint));
         cfg.media_targets
-            .write()
-            .await
-            .push("127.0.0.1:19317".parse().unwrap());
-        assert!(!allowed_udp_destination(&cfg, "127.0.0.1:19317".parse().unwrap()).await);
+            .replace(vec!["127.0.0.1:19317".parse().unwrap()]);
+        assert!(!allowed_udp_destination(
+            &cfg,
+            "127.0.0.1:19317".parse().unwrap()
+        ));
     }
 
     #[tokio::test]
@@ -791,37 +834,89 @@ mod tests {
         reload_media_targets(&cfg, &base, &path).await.unwrap();
         assert!(cfg
             .media_targets
-            .read()
-            .await
             .contains(&"104.29.151.152:19317".parse().unwrap()));
         std::fs::write(&path, "104.29.144.166:19307").unwrap();
         reload_media_targets(&cfg, &base, &path).await.unwrap();
-        let targets = cfg.media_targets.read().await.clone();
-        assert_eq!(targets, ["104.29.144.166:19307".parse().unwrap(), base[0]]);
+        let targets = cfg.media_targets.snapshot();
+        assert_eq!(*targets, ["104.29.144.166:19307".parse().unwrap(), base[0]]);
         std::fs::write(&path, "127.0.0.1:19307").unwrap();
         assert!(reload_media_targets(&cfg, &base, &path).await.is_err());
-        assert_eq!(*cfg.media_targets.read().await, targets);
+        assert_eq!(cfg.media_targets.snapshot(), targets);
         std::fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    fn udp_replies_are_accepted_only_from_recent_destinations() {
+        let now = Instant::now();
+        let media: SocketAddr = "104.29.151.152:19317".parse().unwrap();
+        let other: SocketAddr = "104.29.151.152:19318".parse().unwrap();
+        let mut replies = ReplyFilter::default();
+        assert!(!replies.permits(media, now));
+        replies.sent(media, now);
+        assert!(replies.permits(media, now + REPLY_WINDOW));
+        assert!(!replies.permits(other, now));
+        assert!(!replies.permits(media, now + REPLY_WINDOW + Duration::from_millis(1)));
+        replies.sent(media, now + REPLY_WINDOW);
+        assert!(replies.permits(media, now + 2 * REPLY_WINDOW));
+        assert_eq!(replies.0.len(), 1);
+    }
+
+    #[test]
+    fn udp_reply_filter_evicts_the_least_recently_used_destination() {
+        let now = Instant::now();
+        let target = |port: u16| SocketAddr::from(([104, 29, 151, 152], port));
+        let mut replies = ReplyFilter::default();
+        for port in 0..REPLY_SOURCES as u16 {
+            replies.sent(target(port), now);
+        }
+        replies.sent(target(0), now);
+        replies.sent(target(1000), now);
+        assert_eq!(replies.0.len(), REPLY_SOURCES);
+        assert!(replies.permits(target(0), now));
+        assert!(!replies.permits(target(1), now));
+        assert!(replies.permits(target(1000), now));
+    }
+
     #[tokio::test]
-    async fn udp_domain_resolution_uses_a_session_cache() {
-        let destination: SocketAddr = "1.1.1.1:443".parse().unwrap();
-        let mut cache = HashMap::from([(
-            ("discord.com".to_owned(), 443),
-            (
-                tokio::time::Instant::now() + Duration::from_secs(30),
-                vec![destination],
-            ),
-        )]);
-        assert_eq!(
-            resolve_udp_addresses("discord.com", 443, &mut cache).await,
-            [destination]
-        );
-        assert_eq!(cache.len(), 1);
-        assert!(resolve_udp_addresses("1.1.1.1", 443, &mut cache)
-            .await
-            .contains(&destination));
+    async fn dns_cache_serves_fresh_answers_without_a_lookup() {
+        let cache = DnsCache::default();
+        let now = Instant::now();
+        let ip: IpAddr = "162.159.135.232".parse().unwrap();
+        cache.insert("discord.com", Arc::from([ip]), now);
+        assert_eq!(*cache.resolve("discord.com", 443).await.unwrap(), [ip]);
+        assert!(cache
+            .get(
+                "discord.com",
+                now + DNS_CACHE_TTL - Duration::from_millis(1)
+            )
+            .is_some());
+        assert!(cache.get("discord.com", now + DNS_CACHE_TTL).is_none());
+    }
+
+    #[test]
+    fn dns_cache_is_bounded_and_evicts_the_oldest_entry() {
+        let cache = DnsCache::default();
+        let now = Instant::now();
+        let ip: Arc<[IpAddr]> = Arc::from(["162.159.135.232".parse::<IpAddr>().unwrap()]);
+        for i in 0..DNS_CACHE_ENTRIES {
+            let at = now + Duration::from_millis(i as u64);
+            cache.insert(&format!("{i}.discord.com"), ip.clone(), at);
+        }
+        cache.insert("new.discord.com", ip.clone(), now + Duration::from_secs(1));
+        assert_eq!(cache.0.lock().unwrap().len(), DNS_CACHE_ENTRIES);
+        assert!(cache.get("0.discord.com", now).is_none());
+        assert!(cache.get("1.discord.com", now).is_some());
+        assert!(cache.get("new.discord.com", now).is_some());
+    }
+
+    #[tokio::test]
+    async fn dns_cache_keeps_only_public_answers_for_allowlisted_names() {
+        let cache = DnsCache::default();
+        // IP literals resolve without contacting DNS.
+        let public: IpAddr = "1.1.1.1".parse().unwrap();
+        assert_eq!(*cache.resolve("1.1.1.1", 443).await.unwrap(), [public]);
+        assert!(cache.resolve("127.0.0.1", 443).await.unwrap().is_empty());
+        assert!(cache.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

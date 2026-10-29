@@ -1086,7 +1086,7 @@ fn bench_voice_gateway_udp() {
 // ---------------------------------------------------------------------------
 
 /// `udp::write_frame` on a split client TLS stream → loopback TCP → gateway
-/// `udp::FrameReader` on a split `ActivityStream<TlsStream>`, as in UDP ASSOCIATE.
+/// `udp::FrameReader::next` on a split `ActivityStream<TlsStream>`, as in UDP ASSOCIATE.
 #[test]
 #[ignore = "CPU benchmark; see module docs"]
 fn bench_socks_udp_frames() {
@@ -1107,11 +1107,11 @@ fn bench_socks_udp_frames() {
             let (mut stream, _activity) = protection::ActivityStream::new(tls);
             let (mut reader, _writer) = tokio::io::split(&mut stream);
             let mut frames = FrameReader::default();
-            frames.read(&mut reader).await.unwrap();
+            frames.next(&mut reader).await.unwrap();
             warm_tx.send(()).unwrap();
             let (mut received, mut bytes) = (0u64, 0usize);
             while received < count {
-                bytes += frames.read(&mut reader).await.unwrap().len();
+                bytes += frames.next(&mut reader).await.unwrap().len();
                 received += 1;
             }
             (received, bytes)

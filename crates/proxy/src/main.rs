@@ -54,7 +54,8 @@ struct Config {
     token: String,
     client_tls: Arc<ClientConfig>,
     server_tls: Option<TlsAcceptor>,
-    media_targets: Arc<tokio::sync::RwLock<Vec<SocketAddr>>>,
+    media_targets: policy::MediaTargets,
+    dns: Arc<gateway::DnsCache>,
     voice_identity: Option<Arc<voice::identity::VoiceIdentity>>,
     sessions: session::Registry,
 }
@@ -223,9 +224,10 @@ async fn main() -> Result<()> {
         token,
         client_tls,
         server_tls,
-        media_targets: Arc::new(tokio::sync::RwLock::new(policy::parse_media_targets(
+        media_targets: policy::MediaTargets::new(policy::parse_media_targets(
             &env::var("DINMOO_MEDIA_TARGETS").unwrap_or_default(),
-        )?)),
+        )?),
+        dns: Default::default(),
         voice_identity: if mode == "client" {
             Some(Arc::new(voice::identity::VoiceIdentity::load_or_create(
                 &voice::identity::identity_directory()?,
@@ -237,7 +239,7 @@ async fn main() -> Result<()> {
     if mode == "gateway" {
         if let Some(path) = env::var_os("DINMOO_MEDIA_TARGETS_FILE") {
             let path = std::path::PathBuf::from(path);
-            let base = config.media_targets.read().await.clone();
+            let base = config.media_targets.snapshot();
             gateway::reload_media_targets(&config, &base, &path).await?;
             let cfg = config.clone();
             tokio::spawn(async move {
@@ -288,7 +290,8 @@ pub(crate) fn test_config() -> Config {
         token: "test-token-for-in-memory-protocol".into(),
         client_tls,
         server_tls: None,
-        media_targets: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        media_targets: Default::default(),
+        dns: Default::default(),
         voice_identity: None,
         sessions: session::Registry::new(Duration::from_secs(600)),
     }
