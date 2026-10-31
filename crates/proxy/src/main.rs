@@ -1552,7 +1552,7 @@ async fn relay_udp_gateway<S: AsyncRead + AsyncWrite + Unpin>(
                 if !valid_socks_udp_packet(&packet) { continue; }
                 let Ok((host, port, payload)) = parse_socks_udp_packet(&packet) else { continue; };
                 if payload.is_empty() { continue; }
-                if host.parse::<IpAddr>().is_err() && !allowed_destination(&host) {
+                if host.parse::<IpAddr>().is_err() && !allow_all_destinations() && !allowed_destination(&host) {
                     continue;
                 }
                 let addresses = resolve_udp_addresses(&host, port, &mut dns_cache).await;
@@ -1653,7 +1653,20 @@ async fn receive_optional_udp(
 }
 
 async fn allowed_udp_destination(cfg: &Config, destination: SocketAddr) -> bool {
-    is_public_ip(destination.ip()) && cfg.media_targets.read().await.contains(&destination)
+    is_public_ip(destination.ip())
+        && (allow_all_destinations() || cfg.media_targets.read().await.contains(&destination))
+}
+
+/// Self-hosted gateways can set `DINMOO_ALLOW_ALL_DESTINATIONS=1` to forward any public
+/// destination (full tunnel). Off by default; private and special-use addresses stay blocked.
+fn allow_all_destinations() -> bool {
+    static ALLOW_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOW_ALL
+        .get_or_init(|| parse_allow_all(env::var("DINMOO_ALLOW_ALL_DESTINATIONS").ok().as_deref()))
+}
+
+fn parse_allow_all(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true" | "yes"))
 }
 
 fn parse_socks_udp_packet(packet: &[u8]) -> Result<(String, u16, Vec<u8>)> {
@@ -1776,6 +1789,9 @@ fn allowed_destination(host: &str) -> bool {
 }
 
 fn allowed_tcp_destination(host: &str, port: u16) -> bool {
+    if allow_all_destinations() {
+        return port != 0;
+    }
     if !allowed_destination(host) {
         return false;
     }
@@ -1864,6 +1880,15 @@ mod tests {
             .await
             .push("127.0.0.1:19317".parse().unwrap());
         assert!(!allowed_udp_destination(&cfg, "127.0.0.1:19317".parse().unwrap()).await);
+    }
+
+    #[test]
+    fn allow_all_destinations_is_opt_in() {
+        assert!(!parse_allow_all(None));
+        assert!(!parse_allow_all(Some("")));
+        assert!(!parse_allow_all(Some("0")));
+        assert!(parse_allow_all(Some("1")));
+        assert!(parse_allow_all(Some(" true ")));
     }
 
     #[test]

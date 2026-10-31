@@ -54,6 +54,8 @@ export DINMOO_IDLE_TIMEOUT_SECS=600
 ./target/release/dinmoo-proxy gateway 0.0.0.0:8443
 ```
 
+Self-hosted gateways can set `DINMOO_ALLOW_ALL_DESTINATIONS=1` to forward any public destination instead of only the Discord allowlist (full tunnel). It is off by default; private and special-use addresses stay blocked either way. Do not enable it on a public, token-free gateway: it turns it into an open proxy.
+
 The default client endpoint is `api-proxy.dinmoo.com:443`. Keep its Cloudflare DNS record **DNS only**: the gateway uses a custom TLS protocol. The gateway resolves an explicit Discord domain allowlist, rejects private and special-use destination addresses, and accepts public clients without enrollment. TLS protects the client-to-gateway connection. Individual bandwidth fairness is not implemented.
 
 For an Ubuntu host with an existing Certbot certificate for that endpoint, `deploy/install-gateway.sh <binary> - <systemd-unit>` installs a direct port-443 system service, a 128-session limit, certificate conversion/renewal hooks, and UFW rules for TCP 443 and SSH 9022. This script is specific to that hostname and SSH port; review it before using another host. It runs as root. The service itself runs as an unprivileged account. The optional Nginx configuration supports SNI routing when sharing 443 with a web host; do not use it alongside the direct-port override without reconfiguring the listener.
